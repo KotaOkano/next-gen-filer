@@ -32,7 +32,7 @@ Python のインストールは不要です。以下の手順ですぐに使い�
 
 1. リポジトリをクローンします。
    ```bash
-   git clone https://github.com[あなたのユーザー名]/next-gen-filer.git
+   git clone https://github.com/KotaOkano/next-gen-filer.git
    cd next-gen-filer
    ```
 2. 仮想環境を作成し、依存ライブラリをインストールします。
