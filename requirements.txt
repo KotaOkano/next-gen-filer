@@ -1,0 +1,7 @@
+﻿PySide6==6.12.0
+PySide6_Pdf==6.12.0.140
+PySide6_WebEngine==6.12.0.140
+paramiko==5.1.0
+smbprotocol==1.17.0
+cryptography==50.0.2
+pywin32==312
