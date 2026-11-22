@@ -11,6 +11,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from version import __version__
 from ui.disk_analyzer import get_drive_space_info
 from ui.file_tools_dialog import FileToolsDialog
 from ui.pane_widget import PaneWidget
@@ -23,7 +24,7 @@ BUTTON_STYLE = "font-weight: bold; padding: 6px;"
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Next-Gen File Manager")
+        self.setWindowTitle(f"Next-Gen File Manager v{__version__}")
         self.resize(1200, 800)
 
         self.init_ui()

@@ -1,4 +1,5 @@
 import os
+from datetime import datetime
 from PySide6.QtCore import QThread, Signal, Qt
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLineEdit, 
@@ -27,8 +28,8 @@ class SearchWorker(QThread):
                         try:
                             stat = os.stat(full_path)
                             size_str = f"{stat.st_size / 1024:.1f} KB"
-                            # 簡易的なタイムスタンプ整形などは適宜
-                            self.found_file.emit(full_path, size_str, "---")
+                            date_str = datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M")
+                            self.found_file.emit(full_path, size_str, date_str)
                         except Exception:
                             pass
         except Exception:

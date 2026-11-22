@@ -16,6 +16,7 @@ from PySide6.QtCore import (
     QStandardPaths,
     Qt,
     QThread,
+    QTimer,
     QUrl,
     Signal,
 )
@@ -208,6 +209,9 @@ class InteractiveTableView(QTableView):
             (Qt.Key_F8, Qt.NoModifier, pane.delete_items),
             (Qt.Key_Delete, Qt.NoModifier, pane.delete_items),
             (Qt.Key_Delete, Qt.ShiftModifier, pane.delete_permanently),
+            (Qt.Key_Left, Qt.AltModifier, pane.go_back),
+            (Qt.Key_Right, Qt.AltModifier, pane.go_forward),
+            (Qt.Key_N, Qt.ControlModifier | Qt.ShiftModifier, pane.create_new_folder),
             (Qt.Key_Backspace, Qt.NoModifier, pane.go_parent_directory),
             (Qt.Key_Up, Qt.AltModifier, pane.go_parent_directory),
         ]
@@ -254,6 +258,9 @@ class InteractiveTableView(QTableView):
             menu.addAction(action)
 
         if not index.isValid():
+            add("📁 新しいフォルダ (Ctrl+Shift+N)", pane.create_new_folder)
+            add("📄 新しいテキストファイル", pane.create_new_text_file)
+            menu.addSeparator()
             add("貼り付け (Ctrl+V)", pane.paste_items)
         else:
             path = self._path_of(index)
@@ -281,6 +288,9 @@ class InteractiveTableView(QTableView):
             menu.addSeparator()
 
             add("エクスプローラーで開く", lambda: pane.open_in_explorer(path))
+            menu.addSeparator()
+            add("📁 新しいフォルダ (Ctrl+Shift+N)", pane.create_new_folder)
+            add("📄 新しいテキストファイル", pane.create_new_text_file)
 
         menu.exec(self.viewport().mapToGlobal(pos))
 
@@ -297,6 +307,8 @@ class FileTab(QWidget):
         super().__init__(parent)
         self._path = ""
         self.filter_text = ""
+        self._history: list = []
+        self._history_index = -1
 
         self.model = QFileSystemModel(self)
         self.model.setReadOnly(False)  # 名前の変更を許可する（編集できるのは名前の列だけ）
@@ -337,12 +349,62 @@ class FileTab(QWidget):
 
     def navigate(self, path: str):
         path = normalize_path(path)
+        self._apply_path(path)
+        if self._history_index >= 0 and self._history[self._history_index] == path:
+            return  # 同じフォルダへの移動は履歴に積まない
+        del self._history[self._history_index + 1:]
+        self._history.append(path)
+        self._history_index = len(self._history) - 1
+
+    def _apply_path(self, path: str):
         self.model.setRootPath(path)
         if path:
             self.view.setRootIndex(self.proxy.mapFromSource(self.model.index(path)))
         else:
             self.view.setRootIndex(QModelIndex())
         self._path = path
+
+    @property
+    def can_go_back(self) -> bool:
+        return self._history_index > 0
+
+    @property
+    def can_go_forward(self) -> bool:
+        return 0 <= self._history_index < len(self._history) - 1
+
+    def go_back(self) -> "str | None":
+        i = self._history_index
+        while i > 0:
+            i -= 1
+            target = self._history[i]
+            if not target or os.path.isdir(target):
+                self._history_index = i
+                self._apply_path(target)
+                return target
+        return None
+
+    def go_forward(self) -> "str | None":
+        i = self._history_index
+        while i < len(self._history) - 1:
+            i += 1
+            target = self._history[i]
+            if not target or os.path.isdir(target):
+                self._history_index = i
+                self._apply_path(target)
+                return target
+        return None
+
+    def select_and_rename(self, path: str, _retry: bool = False):
+        """作成した項目を選択して、そのまま名前変更を開始する (エクスプローラー式)"""
+        source_index = self.model.index(path)
+        proxy_index = self.proxy.mapFromSource(source_index) if source_index.isValid() else QModelIndex()
+        if not proxy_index.isValid():
+            if not _retry:  # モデルの反映が遅れている場合は一度だけ少し待って再試行する
+                QTimer.singleShot(300, lambda: self.select_and_rename(path, _retry=True))
+            return
+        self.view.setCurrentIndex(proxy_index)
+        self.view.scrollTo(proxy_index)
+        self.view.rename_index(proxy_index)
 
     def set_filter(self, text: str):
         self.filter_text = text
@@ -385,6 +447,7 @@ class FileOperationWorker(QThread):
     """コピー / 移動 / 削除を別スレッドで実行し、UI を固めない。"""
 
     progressed = Signal(int, int, str)  # 処理中の番号, 全件数, 名前
+    overall = Signal(int)  # 全体の進捗 (0-100 %、ファイル内のバイト進捗を含む)
     done = Signal(object)  # file_ops.OperationResult
 
     def __init__(self, kind: str, paths: list, dest_dir: str = "", parent=None):
@@ -395,21 +458,35 @@ class FileOperationWorker(QThread):
         self._cancelled = False
 
     def cancel(self):
-        """次の項目に進む前に中断する（処理中の1件は最後まで実行される）"""
+        """中断する。コピー / 移動はファイルの途中でも止まり、中途半端なファイルは残らない"""
         self._cancelled = True
 
     def run(self):
+        self._index = 0
+        total_items = max(1, len(self.paths))
+
+        def byte_progress(done_bytes: int, total_bytes: int):
+            fraction = (done_bytes / total_bytes) if total_bytes else 1.0
+            self.overall.emit(min(100, int((self._index + fraction) / total_items * 100)))
+
+        def item_progress(index: int, total: int, name: str):
+            self._index = index
+            self.progressed.emit(index, total, name)
+            if total:
+                self.overall.emit(int(index / total * 100))
+
+        is_cancelled = lambda: self._cancelled  # noqa: E731
         actions = {
-            "copy": lambda p: file_ops.copy_item(p, self.dest_dir),
-            "move": lambda p: file_ops.move_item(p, self.dest_dir),
+            "copy": lambda p: file_ops.copy_item(p, self.dest_dir, progress=byte_progress, is_cancelled=is_cancelled),
+            "move": lambda p: file_ops.move_item(p, self.dest_dir, progress=byte_progress, is_cancelled=is_cancelled),
             "trash": lambda p: file_ops.delete_item(p, permanent=False),
             "delete": lambda p: file_ops.delete_item(p, permanent=True),
         }
         result = file_ops.run_batch(
             self.paths,
             actions[self.kind],
-            progress=self.progressed.emit,
-            is_cancelled=lambda: self._cancelled,
+            progress=item_progress,
+            is_cancelled=is_cancelled,
         )
         self.done.emit(result)
 
@@ -499,6 +576,16 @@ class PaneWidget(QWidget):
     def _build_nav_bar(self) -> QHBoxLayout:
         layout = QHBoxLayout()
 
+        self.back_button = QPushButton("⬅ 戻る")
+        self.back_button.setToolTip("戻る (Alt+←)")
+        self.back_button.clicked.connect(self.go_back)
+        layout.addWidget(self.back_button)
+
+        self.forward_button = QPushButton("➡ 進む")
+        self.forward_button.setToolTip("進む (Alt+→)")
+        self.forward_button.clicked.connect(self.go_forward)
+        layout.addWidget(self.forward_button)
+
         self.path_input = QLineEdit()
         self.path_input.returnPressed.connect(self.on_path_entered)
         layout.addWidget(self.path_input)
@@ -506,7 +593,21 @@ class PaneWidget(QWidget):
         up_button = QPushButton("⬆ 上へ")
         up_button.clicked.connect(self.go_parent_directory)
         layout.addWidget(up_button)
+
+        new_button = QPushButton("➕ 新規作成")
+        new_menu = QMenu(new_button)
+        folder_action = new_menu.addAction("📁 新しいフォルダ (Ctrl+Shift+N)")
+        folder_action.triggered.connect(self.create_new_folder)
+        text_action = new_menu.addAction("📄 新しいテキストファイル")
+        text_action.triggered.connect(self.create_new_text_file)
+        new_button.setMenu(new_menu)
+        layout.addWidget(new_button)
         return layout
+
+    def _update_nav_buttons(self):
+        tab = self.current_tab()
+        self.back_button.setEnabled(bool(tab and tab.can_go_back))
+        self.forward_button.setEnabled(bool(tab and tab.can_go_forward))
 
     def _build_search_bar(self) -> QHBoxLayout:
         layout = QHBoxLayout()
@@ -583,6 +684,7 @@ class PaneWidget(QWidget):
         tab = self.current_tab()
         if tab is None:
             return
+        self._update_nav_buttons()
         self.update_path_bar(tab.current_path)
         self._set_search_text(tab.filter_text)
         self.update_selection_stats()
@@ -604,11 +706,54 @@ class PaneWidget(QWidget):
             self._rebuild_drive_buttons()
 
         tab.navigate(path)
+        self._sync_after_navigation(tab)
+
+    def _sync_after_navigation(self, tab: "FileTab"):
+        path = tab.current_path
+        if not path:
+            self._rebuild_drive_buttons()
         tab.set_filter("")
         self._set_search_text("")
         self.update_path_bar(path)
         self.tab_widget.setTabText(self.tab_widget.currentIndex(), tab_title(path))
         self.update_selection_stats()
+        self._update_nav_buttons()
+
+    def go_back(self):
+        tab = self.current_tab()
+        if tab is not None and tab.go_back() is not None:
+            self._sync_after_navigation(tab)
+
+    def go_forward(self):
+        tab = self.current_tab()
+        if tab is not None and tab.go_forward() is not None:
+            self._sync_after_navigation(tab)
+
+    # ==================================================================
+    # 新規作成
+    # ==================================================================
+    def create_new_folder(self):
+        self._create_new_item("folder")
+
+    def create_new_text_file(self):
+        self._create_new_item("text")
+
+    def _create_new_item(self, kind: str):
+        tab = self.current_tab()
+        dest_dir = self.get_current_path()
+        if tab is None or not dest_dir or not os.path.isdir(dest_dir):
+            self._warn("項目を作成できるフォルダを開いてください。（PCドライブ一覧では作成できません）")
+            return
+        try:
+            if kind == "folder":
+                path = file_ops.create_folder(dest_dir)
+            else:
+                path = file_ops.create_text_file(dest_dir)
+        except Exception as exc:  # noqa: BLE001
+            self._warn(f"作成できませんでした:\n{exc}")
+            return
+        self.set_status(f"作成しました: {os.path.basename(path)}")
+        tab.select_and_rename(path)
 
     def on_path_entered(self):
         self.navigate_to_path(parse_user_path(self.path_input.text()))
@@ -852,7 +997,7 @@ class PaneWidget(QWidget):
         label = OPERATION_LABELS[kind]
         self._operation = (kind, dest_dir, clear_clipboard)
 
-        progress = QProgressDialog(f"{label}を準備中...", "キャンセル", 0, len(paths), self)
+        progress = QProgressDialog(f"{label}を準備中...", "キャンセル", 0, 100, self)
         progress.setWindowTitle(label)
         progress.setWindowModality(Qt.WindowModal)
         progress.setMinimumDuration(400)  # 一瞬で終わる操作ではダイアログを出さない
@@ -862,6 +1007,7 @@ class PaneWidget(QWidget):
 
         worker = FileOperationWorker(kind, paths, dest_dir, self)
         worker.progressed.connect(self._on_operation_progress)
+        worker.overall.connect(progress.setValue)
         worker.done.connect(self._on_operation_finished)
         progress.canceled.connect(worker.cancel)
 
@@ -873,7 +1019,6 @@ class PaneWidget(QWidget):
         if progress is None or progress.wasCanceled():
             return
         label = OPERATION_LABELS[self._operation[0]]
-        progress.setValue(index)
         progress.setLabelText(f"{label}中 ({index + 1}/{total}):\n{name}")
 
     def _on_operation_finished(self, result):

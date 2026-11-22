@@ -4,6 +4,8 @@ from PySide6.QtWidgets import (
     QPushButton, QTableWidget, QTableWidgetItem, QComboBox, QMessageBox, QHeaderView
 )
 from PySide6.QtCore import Qt
+from PySide6.QtGui import QColor
+from core.file_ops import validate_item_name
 
 class BatchRenameDialog(QDialog):
     """複数ファイルの一括リネームを行うダイアログ"""
@@ -155,41 +157,127 @@ class BatchRenameDialog(QDialog):
 
         return original_name
 
-    def update_preview(self):
-        self.preview_table.setRowCount(len(self.file_paths))
-        for i, path in enumerate(self.file_paths):
-            orig_name = os.path.basename(path)
+    def _build_plan(self):
+        """リネーム計画を検証して返す。
+
+        戻り値: [ [old_path, orig_name, new_name, error], ... ]
+        error は None (問題なし) か、実行できない理由の文字列。
+        名前の検証・変更後の重複・既存ファイルとの衝突をここで一括チェックする。
+        リネーム対象同士の名前の入れ替え (a→b, b→a) は衝突扱いにせず、
+        実行時に一時名を経由して処理する。
+        """
+        entries = []
+        for i, old_path in enumerate(self.file_paths):
+            orig_name = os.path.basename(old_path)
             new_name = self.generate_new_name(orig_name, i)
-            
+            error = None
+            if new_name != orig_name:
+                try:
+                    new_name = validate_item_name(new_name)
+                except ValueError as e:
+                    error = str(e)
+            entries.append([old_path, orig_name, new_name, error])
+
+        # 変更後の名前の重複 (Windows は大文字小文字を区別しない)
+        seen = {}
+        for idx, e in enumerate(entries):
+            if e[3] is not None or e[1] == e[2]:
+                continue
+            key = (os.path.dirname(e[0]).casefold(), e[2].casefold())
+            if key in seen:
+                e[3] = "変更後の名前が重複しています"
+                other = entries[seen[key]]
+                if other[3] is None:
+                    other[3] = "変更後の名前が重複しています"
+            else:
+                seen[key] = idx
+
+        # 既存ファイルとの衝突。「その名前のファイル自体もリネームで退く」場合だけは
+        # 衝突扱いにしない (a→b, b→c の連鎖を許可するため)。
+        # 名前が変わらないファイルが居座っている名前へのリネームは衝突として弾く。
+        moving = {
+            os.path.normpath(e[0]).casefold()
+            for e in entries
+            if e[3] is None and e[1] != e[2]
+        }
+        for e in entries:
+            if e[3] is not None or e[1] == e[2]:
+                continue
+            target = os.path.join(os.path.dirname(e[0]), e[2])
+            if os.path.exists(target) and os.path.normpath(target).casefold() not in moving:
+                e[3] = "同じ名前のファイルが既にあります"
+        return entries
+
+    def update_preview(self):
+        plan = self._build_plan()
+        self.preview_table.setRowCount(len(plan))
+        for i, (path, orig_name, new_name, error) in enumerate(plan):
             self.preview_table.setItem(i, 0, QTableWidgetItem(orig_name))
-            
+
             new_item = QTableWidgetItem(new_name)
-            if orig_name != new_name:
+            if error is not None:
+                new_item.setForeground(QColor("#d32f2f"))
+                new_item.setToolTip(error)
+            elif orig_name != new_name:
                 new_item.setForeground(Qt.darkGreen)
             self.preview_table.setItem(i, 1, new_item)
 
     def execute_rename(self):
+        plan = self._build_plan()
+
+        # 検証で弾かれたものがあれば、1件もリネームせずに理由を示す
+        invalid = [e for e in plan if e[3] is not None]
+        if invalid:
+            lines = [f"{e[1]} ➔ {e[2]}: {e[3]}" for e in invalid[:10]]
+            if len(invalid) > 10:
+                lines.append(f"…他 {len(invalid) - 10} 件")
+            QMessageBox.warning(
+                self, "リネームできません",
+                "次の項目に問題があるため、リネームを実行しませんでした:\n" + "\n".join(lines))
+            return
+
+        targets = [e for e in plan if e[1] != e[2]]
+        if not targets:
+            QMessageBox.information(self, "一括リネーム", "変更されるファイルがありません。")
+            return
+
+        # 名前の入れ替え・連鎖 (a→b, b→c) に対応するため、全件を一時名へ退避してから本名にする
+        temp_paths = {}
+        moved = []
+        try:
+            for idx, (old_path, orig_name, new_name, _err) in enumerate(targets):
+                dir_name = os.path.dirname(old_path)
+                temp = os.path.join(dir_name, f".ngf-rename-{os.getpid()}-{idx}.tmp")
+                n = 1
+                while os.path.exists(temp):
+                    temp = os.path.join(dir_name, f".ngf-rename-{os.getpid()}-{idx}-{n}.tmp")
+                    n += 1
+                os.rename(old_path, temp)
+                temp_paths[old_path] = temp
+                moved.append(old_path)
+        except Exception as e:
+            # 退避の途中で失敗したら、退避済みを元の名前に戻す
+            for old_path in moved:
+                try:
+                    os.rename(temp_paths[old_path], old_path)
+                except OSError:
+                    pass
+            QMessageBox.warning(self, "エラー", f"リネームの準備中に失敗しました: {e}")
+            return
+
         success_count = 0
         error_messages = []
-
-        for i, old_path in enumerate(self.file_paths):
-            dir_name = os.path.dirname(old_path)
-            orig_name = os.path.basename(old_path)
-            new_name = self.generate_new_name(orig_name, i)
-            
-            if orig_name == new_name:
-                continue
-
-            new_path = os.path.join(dir_name, new_name)
+        for old_path, orig_name, new_name, _err in targets:
+            temp = temp_paths[old_path]
+            new_path = os.path.join(os.path.dirname(old_path), new_name)
             try:
-                os.rename(old_path, new_path)
+                os.rename(temp, new_path)
                 success_count += 1
             except Exception as e:
-                error_messages.append(f"{orig_name} ➔ {new_name}: {e}")
+                error_messages.append(f"{orig_name} ➔ {new_name}: {e} (一時名 {os.path.basename(temp)} のまま残っています)")
 
         if error_messages:
             QMessageBox.warning(self, "完了（一部エラー）", f"{success_count}件成功しましたが、エラーが発生しました:\n" + "\n".join(error_messages))
-        else:
-            QMessageBox.information(self, "成功", f"{success_count}件のファイルを正常に一括リネームしました！")
-        
+            return  # エラー時はダイアログを閉じず、状況を確認できるようにする
+        QMessageBox.information(self, "成功", f"{success_count}件のファイルを正常に一括リネームしました！")
         self.accept()

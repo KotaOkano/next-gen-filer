@@ -205,5 +205,160 @@ class MiscTests(unittest.TestCase):
         self.assertEqual(file_ops.format_size(3 * 1024 ** 3), "3.00 GB")
 
 
+
+class CreateTests(FileOpsTestCase):
+    def test_create_folder(self):
+        p = file_ops.create_folder(self.dst)
+        self.assertTrue(os.path.isdir(p))
+        self.assertEqual(os.path.basename(p), "新しいフォルダ")
+
+    def test_create_folder_unique_name(self):
+        p1 = file_ops.create_folder(self.dst)
+        p2 = file_ops.create_folder(self.dst)
+        self.assertNotEqual(p1, p2)
+        self.assertEqual(os.path.basename(p2), "新しいフォルダ (2)")
+        self.assertTrue(os.path.isdir(p1))
+
+    def test_create_text_file_is_empty(self):
+        p = file_ops.create_text_file(self.dst)
+        self.assertTrue(os.path.isfile(p))
+        self.assertEqual(os.path.basename(p), "新しいテキストファイル.txt")
+        self.assertEqual(read(p), "")
+
+    def test_create_text_file_unique_name(self):
+        file_ops.create_text_file(self.dst)
+        p2 = file_ops.create_text_file(self.dst)
+        self.assertEqual(os.path.basename(p2), "新しいテキストファイル (2).txt")
+
+    def test_create_custom_name(self):
+        p = file_ops.create_folder(self.dst, "作業用")
+        self.assertEqual(os.path.basename(p), "作業用")
+
+    def test_create_in_missing_dir(self):
+        with self.assertRaises(FileNotFoundError):
+            file_ops.create_folder(os.path.join(self.root, "nope"))
+        with self.assertRaises(FileNotFoundError):
+            file_ops.create_text_file(os.path.join(self.root, "nope"))
+
+    def test_invalid_names_are_rejected(self):
+        for bad in ("", "   ", ".", "..", "a/b", "a\\b", "a:b", "a*b", "a?b", 'a"b', "a<b", "a>b", "a|b", "name.", "CON", "con.txt", "LPT1", "aux.py"):
+            with self.assertRaises(ValueError, msg=bad):
+                file_ops.create_folder(self.dst, bad)
+            with self.assertRaises(ValueError, msg=bad):
+                file_ops.create_text_file(self.dst, bad)
+
+
+class ChunkedCopyTests(FileOpsTestCase):
+    def make_big(self, name="big.bin", size=3 * 1024 * 1024 + 123):
+        p = os.path.join(self.src, name)
+        with open(p, "wb") as f:
+            f.write(os.urandom(size))
+        return p
+
+    def test_copy_file_content_and_progress(self):
+        src = self.make_big()
+        seen = []
+        dest = file_ops.copy_item(src, self.dst, progress=lambda d, total: seen.append((d, total)))
+        with open(src, "rb") as f:
+            expected = f.read()
+        with open(dest, "rb") as f:
+            self.assertEqual(f.read(), expected)
+        self.assertEqual(seen[-1], (os.path.getsize(src), os.path.getsize(src)))
+
+    def test_copy_preserves_mtime(self):
+        src = self.make_big()
+        os.utime(src, (1_600_000_000, 1_600_000_000))
+        dest = file_ops.copy_item(src, self.dst)
+        self.assertEqual(int(os.path.getmtime(dest)), 1_600_000_000)
+
+    def test_cancel_leaves_no_file(self):
+        src = self.make_big()
+        calls = []
+
+        def cancel_after_first():
+            calls.append(1)
+            return len(calls) > 1
+
+        with self.assertRaises(file_ops.OperationCancelled):
+            file_ops.copy_item(src, self.dst, is_cancelled=cancel_after_first)
+        self.assertEqual(os.listdir(self.dst), [])  # 一時ファイルも残らない
+
+    def test_copy_folder_with_progress(self):
+        write(os.path.join(self.src, "d", "a.txt"), "aaa")
+        write(os.path.join(self.src, "d", "sub", "b.txt"), "bbb")
+        seen = []
+        dest = file_ops.copy_item(os.path.join(self.src, "d"), self.dst,
+                                  progress=lambda d, total: seen.append((d, total)))
+        self.assertEqual(read(os.path.join(dest, "a.txt")), "aaa")
+        self.assertEqual(read(os.path.join(dest, "sub", "b.txt")), "bbb")
+        self.assertEqual(seen[-1][0], seen[-1][1])
+
+    def test_cancel_folder_copy_removes_partial(self):
+        write(os.path.join(self.src, "d", "a.txt"), "aaa")
+        with self.assertRaises(file_ops.OperationCancelled):
+            file_ops.copy_item(os.path.join(self.src, "d"), self.dst, is_cancelled=lambda: True)
+        self.assertEqual(os.listdir(self.dst), [])
+
+    def test_run_batch_mid_file_cancel_is_not_a_failure(self):
+        src = self.make_big()
+        result = file_ops.run_batch(
+            [src],
+            lambda p: file_ops.copy_item(p, self.dst, is_cancelled=lambda: True),
+        )
+        self.assertTrue(result.cancelled)
+        self.assertEqual(result.failed, [])
+        self.assertEqual(result.success_count, 0)
+
+
+
+
+class V111RegressionTests(unittest.TestCase):
+    """v1.1.1 の修正に対する回帰テスト。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="ngf-test-111-")
+
+    def tearDown(self):
+        for root, dirs, files in os.walk(self.tmp):
+            for name in dirs + files:
+                try:
+                    os.chmod(os.path.join(root, name), 0o755)
+                except OSError:
+                    pass
+        file_ops._rmtree(self.tmp) if os.path.exists(self.tmp) else None
+
+    def test_format_size_boundaries(self):
+        self.assertEqual(file_ops.format_size(0), "0 bytes")
+        self.assertEqual(file_ops.format_size(1023), "1023 bytes")
+        self.assertEqual(file_ops.format_size(1024), "1.00 KB")
+        self.assertEqual(file_ops.format_size(1024 ** 2), "1.00 MB")
+        self.assertEqual(file_ops.format_size(1024 ** 3), "1.00 GB")
+
+    def test_validate_name_length(self):
+        self.assertEqual(file_ops.validate_item_name("a" * 255), "a" * 255)
+        with self.assertRaises(ValueError):
+            file_ops.validate_item_name("a" * 256)
+
+    def test_delete_readonly_file(self):
+        p = os.path.join(self.tmp, "ro.txt")
+        with open(p, "w") as f:
+            f.write("x")
+        os.chmod(p, 0o444)
+        file_ops.delete_item(p, permanent=True)
+        self.assertFalse(os.path.exists(p))
+
+    def test_delete_readonly_tree(self):
+        d = os.path.join(self.tmp, "tree")
+        sub = os.path.join(d, "sub")
+        os.makedirs(sub)
+        p = os.path.join(sub, "ro.txt")
+        with open(p, "w") as f:
+            f.write("x")
+        os.chmod(p, 0o444)
+        os.chmod(sub, 0o555)
+        file_ops.delete_item(d, permanent=True)
+        self.assertFalse(os.path.exists(d))
+
+
 if __name__ == "__main__":
     unittest.main()
