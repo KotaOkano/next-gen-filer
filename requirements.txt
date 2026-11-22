@@ -5,3 +5,4 @@ paramiko==5.1.0
 smbprotocol==1.17.0
 cryptography==50.0.2
 pywin32==312
+Send2Trash==2.2.0
