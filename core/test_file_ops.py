@@ -360,5 +360,239 @@ class V111RegressionTests(unittest.TestCase):
         self.assertFalse(os.path.exists(d))
 
 
+
+class ConflictPolicyTests(FileOpsTestCase):
+    """v1.2.0: 名前衝突時のポリシー (置換 / スキップ / 両方残す / マージ)。"""
+
+    def test_copy_default_keeps_both(self):
+        write(os.path.join(self.src, "a.txt"), "new")
+        write(os.path.join(self.dst, "a.txt"), "old")
+        dest = file_ops.copy_item(os.path.join(self.src, "a.txt"), self.dst)
+        self.assertEqual(os.path.basename(dest), "a (2).txt")
+
+    def test_copy_overwrite_replaces_file(self):
+        write(os.path.join(self.src, "a.txt"), "new")
+        write(os.path.join(self.dst, "a.txt"), "old")
+        dest = file_ops.copy_item(
+            os.path.join(self.src, "a.txt"), self.dst, on_conflict=file_ops.CONFLICT_OVERWRITE
+        )
+        self.assertEqual(dest, os.path.join(self.dst, "a.txt"))
+        self.assertEqual(read(dest), "new")
+
+    def test_copy_overwrite_replaces_folder(self):
+        write(os.path.join(self.src, "d", "new.txt"), "new")
+        write(os.path.join(self.dst, "d", "old.txt"), "old")
+        dest = file_ops.copy_item(
+            os.path.join(self.src, "d"), self.dst, on_conflict=file_ops.CONFLICT_OVERWRITE
+        )
+        self.assertTrue(os.path.exists(os.path.join(dest, "new.txt")))
+        self.assertFalse(os.path.exists(os.path.join(dest, "old.txt")))
+
+    def test_copy_skip_raises_and_copies_nothing(self):
+        write(os.path.join(self.src, "a.txt"), "new")
+        write(os.path.join(self.dst, "a.txt"), "old")
+        with self.assertRaises(file_ops.ItemSkipped):
+            file_ops.copy_item(
+                os.path.join(self.src, "a.txt"), self.dst, on_conflict=file_ops.CONFLICT_SKIP
+            )
+        self.assertEqual(read(os.path.join(self.dst, "a.txt")), "old")
+
+    def test_copy_skip_without_conflict_works(self):
+        write(os.path.join(self.src, "a.txt"), "new")
+        dest = file_ops.copy_item(
+            os.path.join(self.src, "a.txt"), self.dst, on_conflict=file_ops.CONFLICT_SKIP
+        )
+        self.assertEqual(read(dest), "new")
+
+    def test_copy_into_same_folder_never_overwrites_itself(self):
+        p = os.path.join(self.src, "a.txt")
+        write(p, "hello")
+        dest = file_ops.copy_item(p, self.src, on_conflict=file_ops.CONFLICT_OVERWRITE)
+        self.assertEqual(read(p), "hello")
+        self.assertEqual(read(dest), "hello")
+        self.assertNotEqual(dest, p)
+
+    def test_copy_merge_folders(self):
+        write(os.path.join(self.src, "d", "a.txt"), "from-src")
+        write(os.path.join(self.src, "d", "sub", "c.txt"), "deep")
+        write(os.path.join(self.dst, "d", "a.txt"), "from-dst")
+        write(os.path.join(self.dst, "d", "b.txt"), "keep")
+        dest = file_ops.copy_item(
+            os.path.join(self.src, "d"), self.dst, on_conflict=file_ops.CONFLICT_MERGE
+        )
+        self.assertEqual(dest, os.path.join(self.dst, "d"))
+        self.assertEqual(read(os.path.join(dest, "a.txt")), "from-src")  # 中のファイルは上書き
+        self.assertEqual(read(os.path.join(dest, "b.txt")), "keep")      # 宛先だけのファイルは残る
+        self.assertEqual(read(os.path.join(dest, "sub", "c.txt")), "deep")
+
+    def test_merge_policy_on_files_falls_back_to_overwrite(self):
+        write(os.path.join(self.src, "a.txt"), "new")
+        write(os.path.join(self.dst, "a.txt"), "old")
+        dest = file_ops.copy_item(
+            os.path.join(self.src, "a.txt"), self.dst, on_conflict=file_ops.CONFLICT_MERGE
+        )
+        self.assertEqual(read(dest), "new")
+
+    def test_move_overwrite(self):
+        write(os.path.join(self.src, "a.txt"), "new")
+        write(os.path.join(self.dst, "a.txt"), "old")
+        dest = file_ops.move_item(
+            os.path.join(self.src, "a.txt"), self.dst, on_conflict=file_ops.CONFLICT_OVERWRITE
+        )
+        self.assertEqual(read(dest), "new")
+        self.assertFalse(os.path.exists(os.path.join(self.src, "a.txt")))
+
+    def test_move_skip_keeps_source(self):
+        write(os.path.join(self.src, "a.txt"), "new")
+        write(os.path.join(self.dst, "a.txt"), "old")
+        with self.assertRaises(file_ops.ItemSkipped):
+            file_ops.move_item(
+                os.path.join(self.src, "a.txt"), self.dst, on_conflict=file_ops.CONFLICT_SKIP
+            )
+        self.assertTrue(os.path.exists(os.path.join(self.src, "a.txt")))
+        self.assertEqual(read(os.path.join(self.dst, "a.txt")), "old")
+
+    def test_move_merge_folders(self):
+        write(os.path.join(self.src, "d", "a.txt"), "from-src")
+        write(os.path.join(self.dst, "d", "b.txt"), "keep")
+        dest = file_ops.move_item(
+            os.path.join(self.src, "d"), self.dst, on_conflict=file_ops.CONFLICT_MERGE
+        )
+        self.assertEqual(read(os.path.join(dest, "a.txt")), "from-src")
+        self.assertEqual(read(os.path.join(dest, "b.txt")), "keep")
+        self.assertFalse(os.path.exists(os.path.join(self.src, "d")))
+
+    def test_chunked_copy_overwrite_for_big_file(self):
+        src = os.path.join(self.src, "big.bin")
+        with open(src, "wb") as f:
+            f.write(os.urandom(2 * 1024 * 1024 + 7))
+        write(os.path.join(self.dst, "big.bin"), "old")
+        seen = []
+        dest = file_ops.copy_item(
+            src,
+            self.dst,
+            progress=lambda d, t: seen.append((d, t)),
+            on_conflict=file_ops.CONFLICT_OVERWRITE,
+        )
+        self.assertEqual(dest, os.path.join(self.dst, "big.bin"))
+        self.assertEqual(os.path.getsize(dest), 2 * 1024 * 1024 + 7)
+        self.assertEqual(seen[-1], (2 * 1024 * 1024 + 7, 2 * 1024 * 1024 + 7))
+
+    def test_run_batch_records_skips_separately(self):
+        write(os.path.join(self.src, "a.txt"), "new")
+        write(os.path.join(self.src, "b.txt"), "bee")
+        write(os.path.join(self.dst, "a.txt"), "old")
+        paths = [os.path.join(self.src, "a.txt"), os.path.join(self.src, "b.txt")]
+        result = file_ops.run_batch(
+            paths,
+            lambda p: file_ops.copy_item(p, self.dst, on_conflict=file_ops.CONFLICT_SKIP),
+        )
+        self.assertEqual(result.skipped, [paths[0]])
+        self.assertEqual(result.failed, [])
+        self.assertEqual(result.success_count, 1)
+
+
+class FolderSizeTests(FileOpsTestCase):
+    def test_folder_total_size_sums_recursively(self):
+        write(os.path.join(self.src, "d", "a.txt"), "12345")
+        write(os.path.join(self.src, "d", "sub", "b.txt"), "123")
+        self.assertEqual(file_ops.folder_total_size(os.path.join(self.src, "d")), 8)
+
+    def test_folder_total_size_empty_folder(self):
+        os.makedirs(os.path.join(self.src, "empty"))
+        self.assertEqual(file_ops.folder_total_size(os.path.join(self.src, "empty")), 0)
+
+
+class ZipTests(FileOpsTestCase):
+    """v1.2.0: ZIP 圧縮 / 展開。"""
+
+    def test_create_and_extract_file(self):
+        write(os.path.join(self.src, "a.txt"), "hello zip")
+        archive = file_ops.create_zip([os.path.join(self.src, "a.txt")], self.dst)
+        self.assertEqual(os.path.basename(archive), "a.zip")
+        out = os.path.join(self.root, "out")
+        os.makedirs(out)
+        created = file_ops.extract_zip(archive, out)
+        self.assertEqual(created, [os.path.join(out, "a.txt")])
+        self.assertEqual(read(os.path.join(out, "a.txt")), "hello zip")
+
+    def test_create_zip_folder_recursion_and_name(self):
+        write(os.path.join(self.src, "d", "x.txt"), "x")
+        write(os.path.join(self.src, "d", "sub", "y.txt"), "y")
+        archive = file_ops.create_zip([os.path.join(self.src, "d")], self.dst)
+        self.assertEqual(os.path.basename(archive), "d.zip")
+        out = os.path.join(self.root, "out")
+        os.makedirs(out)
+        created = file_ops.extract_zip(archive, out)
+        self.assertEqual(created, [os.path.join(out, "d")])
+        self.assertEqual(read(os.path.join(out, "d", "sub", "y.txt")), "y")
+
+    def test_create_zip_multiple_items(self):
+        write(os.path.join(self.src, "a.txt"), "a")
+        write(os.path.join(self.src, "b.txt"), "b")
+        archive = file_ops.create_zip(
+            [os.path.join(self.src, "a.txt"), os.path.join(self.src, "b.txt")], self.dst
+        )
+        out = os.path.join(self.root, "out")
+        os.makedirs(out)
+        file_ops.extract_zip(archive, out)
+        self.assertEqual(read(os.path.join(out, "a.txt")), "a")
+        self.assertEqual(read(os.path.join(out, "b.txt")), "b")
+
+    def test_create_zip_avoids_overwrite(self):
+        write(os.path.join(self.src, "a.txt"), "a")
+        first = file_ops.create_zip([os.path.join(self.src, "a.txt")], self.dst)
+        second = file_ops.create_zip([os.path.join(self.src, "a.txt")], self.dst)
+        self.assertNotEqual(first, second)
+        self.assertEqual(os.path.basename(second), "a (2).zip")
+
+    def test_create_zip_custom_name(self):
+        write(os.path.join(self.src, "a.txt"), "a")
+        archive = file_ops.create_zip([os.path.join(self.src, "a.txt")], self.dst, archive_name="まとめ")
+        self.assertEqual(os.path.basename(archive), "まとめ.zip")
+
+    def test_create_zip_empty_paths(self):
+        with self.assertRaises(ValueError):
+            file_ops.create_zip([], self.dst)
+
+    def test_create_zip_cancel_removes_partial(self):
+        write(os.path.join(self.src, "a.txt"), "a")
+        with self.assertRaises(file_ops.OperationCancelled):
+            file_ops.create_zip(
+                [os.path.join(self.src, "a.txt")], self.dst, is_cancelled=lambda: True
+            )
+        self.assertEqual(os.listdir(self.dst), [])
+
+    def test_create_zip_progress_reaches_total(self):
+        write(os.path.join(self.src, "a.txt"), "12345")
+        seen = []
+        file_ops.create_zip(
+            [os.path.join(self.src, "a.txt")], self.dst, progress=lambda d, t: seen.append((d, t))
+        )
+        self.assertEqual(seen[-1], (5, 5))
+
+    def test_extract_blocks_zip_slip(self):
+        import zipfile
+
+        evil = os.path.join(self.root, "evil.zip")
+        with zipfile.ZipFile(evil, "w") as zf:
+            zf.writestr("../escape.txt", "bad")
+            zf.writestr("ok.txt", "good")
+        out = os.path.join(self.root, "out")
+        os.makedirs(out)
+        created = file_ops.extract_zip(evil, out)
+        self.assertEqual(created, [os.path.join(out, "ok.txt")])
+        self.assertFalse(os.path.exists(os.path.join(self.root, "escape.txt")))
+        self.assertEqual(read(os.path.join(out, "ok.txt")), "good")
+
+    def test_extract_overwrites_existing_file(self):
+        write(os.path.join(self.src, "a.txt"), "new")
+        archive = file_ops.create_zip([os.path.join(self.src, "a.txt")], self.dst)
+        write(os.path.join(self.dst, "a.txt"), "old")
+        file_ops.extract_zip(archive, self.dst)
+        self.assertEqual(read(os.path.join(self.dst, "a.txt")), "new")
+
+
+
 if __name__ == "__main__":
     unittest.main()

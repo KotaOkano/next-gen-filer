@@ -1,6 +1,7 @@
 
 from __future__ import annotations
 
+import datetime
 import os
 import re
 import struct
@@ -10,8 +11,10 @@ import sys
 from PySide6.QtCore import (
     QByteArray,
     QDir,
+    QEvent,
     QMimeData,
     QModelIndex,
+    QSettings,
     QSortFilterProxyModel,
     QStandardPaths,
     Qt,
@@ -20,8 +23,12 @@ from PySide6.QtCore import (
     QUrl,
     Signal,
 )
-from PySide6.QtGui import QAction, QDesktopServices, QGuiApplication, QKeyEvent
+from PySide6.QtGui import QAction, QDesktopServices, QDrag, QGuiApplication, QKeyEvent
 from PySide6.QtWidgets import (
+    QAbstractItemView,
+    QDialog,
+    QDialogButtonBox,
+    QFormLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -29,6 +36,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QProgressDialog,
     QPushButton,
+    QRadioButton,
     QTableView,
     QTabWidget,
     QVBoxLayout,
@@ -41,6 +49,7 @@ except ImportError:
     from PySide6.QtWidgets import QFileSystemModel
 
 from core import file_ops
+from core.size_worker import FolderSizeWorker
 from ui.batch_rename_dialog import BatchRenameDialog
 from ui.quick_look_dialog import QuickLookDialog
 
@@ -95,6 +104,25 @@ SEARCH_INPUT_STYLE = """
 """
 
 STATUS_STYLE = "color: #aaa; padding: 4px; font-size: 12px;"
+
+# 実行中の FolderSizeWorker を保持する (スレッド実行中に破棄されないように)
+_LIVE_SIZE_WORKERS: list = []
+
+
+def start_folder_size_worker(path: str, callback):
+    """フォルダの合計サイズを別スレッドで数え、callback(path, size) で返す。"""
+    worker = FolderSizeWorker(path)
+    _LIVE_SIZE_WORKERS.append(worker)
+
+    def _done(done_path, size):
+        if worker in _LIVE_SIZE_WORKERS:
+            _LIVE_SIZE_WORKERS.remove(worker)
+        worker.deleteLater()
+        callback(done_path, size)
+
+    worker.finished.connect(_done)
+    worker.start()
+    return worker
 
 
 # ----------------------------------------------------------------------
@@ -185,11 +213,15 @@ class InteractiveTableView(QTableView):
     def __init__(self, pane: "PaneWidget", parent=None):
         super().__init__(parent)
         self.pane = pane
+        self._drag_start_pos = None
 
         # ダブルクリック等による勝手な編集を防ぐ（名前変更は F2 / メニューから明示的に開始する）
         self.setEditTriggers(QTableView.NoEditTriggers)
         self.setContextMenuPolicy(Qt.CustomContextMenu)
         self.customContextMenuRequested.connect(self.show_context_menu)
+        # ドラッグ＆ドロップ (ドラッグ開始は mouseMoveEvent で自前処理する)
+        self.setAcceptDrops(True)
+        self.setDropIndicatorShown(True)
 
         # (キー, 修飾キー, 実行する処理)
         self._shortcuts = [
@@ -212,12 +244,23 @@ class InteractiveTableView(QTableView):
             (Qt.Key_Left, Qt.AltModifier, pane.go_back),
             (Qt.Key_Right, Qt.AltModifier, pane.go_forward),
             (Qt.Key_N, Qt.ControlModifier | Qt.ShiftModifier, pane.create_new_folder),
+            (Qt.Key_W, Qt.ControlModifier, pane.close_current_tab),
+            (Qt.Key_H, Qt.ControlModifier, pane.toggle_hidden_files),
             (Qt.Key_Backspace, Qt.NoModifier, pane.go_parent_directory),
             (Qt.Key_Up, Qt.AltModifier, pane.go_parent_directory),
         ]
 
     # ---- キー操作 ----------------------------------------------------
     def keyPressEvent(self, event: QKeyEvent):
+        # Ctrl+Tab / Ctrl+Shift+Tab はタブの切り替え (Shift+Tab は Backtab で届く)
+        if event.modifiers() & Qt.ControlModifier and event.key() in (Qt.Key_Tab, Qt.Key_Backtab):
+            if event.key() == Qt.Key_Backtab or event.modifiers() & Qt.ShiftModifier:
+                self.pane.activate_previous_tab()
+            else:
+                self.pane.activate_next_tab()
+            event.accept()
+            return
+
         modifiers = event.modifiers()
         if modifiers == Qt.KeypadModifier:  # テンキーの Enter など
             modifiers = Qt.NoModifier
@@ -246,6 +289,81 @@ class InteractiveTableView(QTableView):
     def rename_current(self):
         self.rename_index(self.currentIndex())
 
+    # ---- ドラッグ＆ドロップ ------------------------------------------
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._drag_start_pos = event.pos()
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if (
+            self._drag_start_pos is not None
+            and event.buttons() & Qt.LeftButton
+            and self.state() != QAbstractItemView.EditingState
+            and (event.pos() - self._drag_start_pos).manhattanLength() >= 10
+        ):
+            self._drag_start_pos = None
+            self._start_drag(event.modifiers())
+            return
+        super().mouseMoveEvent(event)
+
+    def _start_drag(self, modifiers):
+        tab = self.pane.current_tab()
+        paths = tab.selected_paths() if tab else []
+        if not paths:
+            return
+        mime = QMimeData()
+        mime.setUrls([QUrl.fromLocalFile(p) for p in paths])
+        drag = QDrag(self)
+        drag.setMimeData(mime)
+        # 既定はコピー、Shift を押しながらなら移動 (修飾キーはドロップ先が最終判断する)
+        default = Qt.MoveAction if modifiers & Qt.ShiftModifier else Qt.CopyAction
+        drag.exec(Qt.CopyAction | Qt.MoveAction, default)
+
+    @staticmethod
+    def _drop_action(event) -> Qt.DropAction:
+        """Shift を押しながらなら移動、それ以外はコピー。"""
+        if event.keyboardModifiers() & Qt.ShiftModifier and event.possibleActions() & Qt.MoveAction:
+            return Qt.MoveAction
+        return Qt.CopyAction
+
+    def _drop_target_dir(self, pos):
+        """ドロップ先フォルダを返す。フォルダ行の上ならそのフォルダ、それ以外は表示中のフォルダ。"""
+        tab = self.pane.current_tab()
+        if tab is None:
+            return None
+        index = self.indexAt(pos)
+        if index.isValid():
+            path = self._path_of(index)
+            if path and os.path.isdir(path):
+                return normalize_path(path)
+        return tab.current_path or None
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls() and self._drop_target_dir(event.pos()) is not None:
+            event.setDropAction(self._drop_action(event))
+            event.accept()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event):
+        if event.mimeData().hasUrls() and self._drop_target_dir(event.pos()) is not None:
+            event.setDropAction(self._drop_action(event))
+            event.accept()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event):
+        dest_dir = self._drop_target_dir(event.pos())
+        paths = [url.toLocalFile() for url in event.mimeData().urls() if url.isLocalFile()]
+        if dest_dir is None or not paths:
+            event.ignore()
+            return
+        move = self._drop_action(event) == Qt.MoveAction
+        event.setDropAction(Qt.MoveAction if move else Qt.CopyAction)
+        event.accept()
+        self.pane.accept_drop(paths, dest_dir, move)
+
     # ---- 右クリックメニュー ------------------------------------------
     def show_context_menu(self, pos):
         pane = self.pane
@@ -257,11 +375,20 @@ class InteractiveTableView(QTableView):
             action.triggered.connect(lambda _checked=False: slot())
             menu.addAction(action)
 
+        def add_hidden_toggle():
+            action = QAction("隠しファイルを表示 (Ctrl+H)", menu)
+            action.setCheckable(True)
+            action.setChecked(pane.show_hidden)
+            action.triggered.connect(lambda _checked=False: pane.toggle_hidden_files())
+            menu.addAction(action)
+
         if not index.isValid():
             add("📁 新しいフォルダ (Ctrl+Shift+N)", pane.create_new_folder)
             add("📄 新しいテキストファイル", pane.create_new_text_file)
             menu.addSeparator()
             add("貼り付け (Ctrl+V)", pane.paste_items)
+            menu.addSeparator()
+            add_hidden_toggle()
         else:
             path = self._path_of(index)
 
@@ -289,6 +416,18 @@ class InteractiveTableView(QTableView):
 
             add("エクスプローラーで開く", lambda: pane.open_in_explorer(path))
             menu.addSeparator()
+
+            add("📋 パスをコピー", lambda: pane.copy_path_to_clipboard(path))
+            add("ℹ️ プロパティ", lambda: pane.show_properties(path))
+            menu.addSeparator()
+
+            add("🗜️ ZIPに圧縮", pane.compress_selected_to_zip)
+            if path.lower().endswith(".zip"):
+                add("🗜️ ZIPを展開 (ここに展開)", lambda: pane.extract_zip_archive(path))
+            menu.addSeparator()
+
+            add_hidden_toggle()
+            menu.addSeparator()
             add("📁 新しいフォルダ (Ctrl+Shift+N)", pane.create_new_folder)
             add("📄 新しいテキストファイル", pane.create_new_text_file)
 
@@ -312,6 +451,7 @@ class FileTab(QWidget):
 
         self.model = QFileSystemModel(self)
         self.model.setReadOnly(False)  # 名前の変更を許可する（編集できるのは名前の列だけ）
+        self.model.setFilter(QDir.AllEntries | QDir.NoDotAndDotDot | QDir.AllDirs)
 
         self.proxy = FileSortFilterProxyModel(self)
         self.proxy.setSourceModel(self.model)
@@ -410,6 +550,34 @@ class FileTab(QWidget):
         self.filter_text = text
         self.proxy.setFilterFixedString(text)
 
+    # ---- 表示設定 (隠しファイル・列幅・ソート) --------------------------
+    def set_show_hidden(self, show: bool):
+        filters = QDir.AllEntries | QDir.NoDotAndDotDot | QDir.AllDirs
+        if show:
+            filters |= QDir.Hidden
+        self.model.setFilter(filters)
+
+    def column_widths(self) -> list:
+        header = self.view.horizontalHeader()
+        return [header.sectionSize(i) for i in range(4)]
+
+    def apply_column_widths(self, widths):
+        for i, width in enumerate(list(widths)[:4]):
+            try:
+                width = int(width)
+            except (TypeError, ValueError):
+                continue
+            if width > 0:
+                self.view.setColumnWidth(i, width)
+
+    def sort_state(self) -> tuple:
+        header = self.view.horizontalHeader()
+        return header.sortIndicatorSection(), header.sortIndicatorOrder()
+
+    def apply_sort(self, column: int, order):
+        if 0 <= column < 4:
+            self.view.sortByColumn(column, order)
+
     # ---- 選択・パスの取得 --------------------------------------------
     def path_at(self, index: QModelIndex) -> str:
         if not index.isValid():
@@ -450,11 +618,19 @@ class FileOperationWorker(QThread):
     overall = Signal(int)  # 全体の進捗 (0-100 %、ファイル内のバイト進捗を含む)
     done = Signal(object)  # file_ops.OperationResult
 
-    def __init__(self, kind: str, paths: list, dest_dir: str = "", parent=None):
+    def __init__(
+        self,
+        kind: str,
+        paths: list,
+        dest_dir: str = "",
+        parent=None,
+        on_conflict: str = file_ops.CONFLICT_RENAME,
+    ):
         super().__init__(parent)
         self.kind = kind
         self.paths = list(paths)
         self.dest_dir = dest_dir
+        self.on_conflict = on_conflict
         self._cancelled = False
 
     def cancel(self):
@@ -477,8 +653,8 @@ class FileOperationWorker(QThread):
 
         is_cancelled = lambda: self._cancelled  # noqa: E731
         actions = {
-            "copy": lambda p: file_ops.copy_item(p, self.dest_dir, progress=byte_progress, is_cancelled=is_cancelled),
-            "move": lambda p: file_ops.move_item(p, self.dest_dir, progress=byte_progress, is_cancelled=is_cancelled),
+            "copy": lambda p: file_ops.copy_item(p, self.dest_dir, progress=byte_progress, is_cancelled=is_cancelled, on_conflict=self.on_conflict),
+            "move": lambda p: file_ops.move_item(p, self.dest_dir, progress=byte_progress, is_cancelled=is_cancelled, on_conflict=self.on_conflict),
             "trash": lambda p: file_ops.delete_item(p, permanent=False),
             "delete": lambda p: file_ops.delete_item(p, permanent=True),
         }
@@ -491,18 +667,163 @@ class FileOperationWorker(QThread):
         self.done.emit(result)
 
 
+class ArchiveWorker(QThread):
+    """ZIP 圧縮 / 展開を別スレッドで実行し、UI を固めない。"""
+
+    progressed = Signal(int)  # 全体の進捗 (0-100 %)
+    done = Signal(object)  # (成功したか, 圧縮先パス or 展開した項目リスト or エラー文字列)
+
+    def __init__(self, kind: str, paths: list, dest_dir: str, archive: str = "", parent=None):
+        super().__init__(parent)
+        self.kind = kind  # "compress" | "extract"
+        self.paths = list(paths)
+        self.dest_dir = dest_dir
+        self.archive = archive
+        self._cancelled = False
+
+    def cancel(self):
+        self._cancelled = True
+
+    def run(self):
+        is_cancelled = lambda: self._cancelled  # noqa: E731
+
+        def progress(done_bytes: int, total_bytes: int):
+            self.progressed.emit(int(done_bytes / total_bytes * 100) if total_bytes else 100)
+
+        try:
+            if self.kind == "compress":
+                result = file_ops.create_zip(
+                    self.paths, self.dest_dir, progress=progress, is_cancelled=is_cancelled
+                )
+            else:
+                result = file_ops.extract_zip(
+                    self.archive, self.dest_dir, progress=progress, is_cancelled=is_cancelled
+                )
+        except file_ops.OperationCancelled:
+            self.done.emit((False, "キャンセルされました"))
+            return
+        except Exception as exc:  # noqa: BLE001
+            self.done.emit((False, str(exc) or type(exc).__name__))
+            return
+        self.done.emit((True, result))
+
+
+class ConflictDialog(QDialog):
+    """宛先に同名の項目があるとき、どう扱うかを選ぶダイアログ。"""
+
+    def __init__(self, conflict_paths: list, dest_dir: str, has_folder_conflict: bool, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("名前の衝突")
+        self._policy = None
+
+        layout = QVBoxLayout(self)
+        listing = "\n".join(
+            f"  ・{os.path.basename(os.path.normpath(p)) or p}" for p in conflict_paths[:5]
+        )
+        if len(conflict_paths) > 5:
+            listing += f"\n  …ほか {len(conflict_paths) - 5} 件"
+        label = QLabel(
+            f"宛先 ({native(dest_dir)}) には、同名の項目が {len(conflict_paths)} 件あります。\n"
+            f"どうしますか？（選んだ扱いは今回の操作すべてに適用されます）\n\n{listing}"
+        )
+        label.setWordWrap(True)
+        layout.addWidget(label)
+
+        self._radios = []
+        options = [
+            (file_ops.CONFLICT_RENAME, "両方残す（自動で別名にする）", True),
+            (file_ops.CONFLICT_OVERWRITE, "置き換える（既存の項目は失われます）", False),
+        ]
+        if has_folder_conflict:
+            options.append(
+                (file_ops.CONFLICT_MERGE, "フォルダは中身を統合する（マージ。ファイル同士は置き換え）", False)
+            )
+        options.append((file_ops.CONFLICT_SKIP, "スキップする（既存の項目を残す）", False))
+        for policy, text, checked in options:
+            radio = QRadioButton(text)
+            radio.setChecked(checked)
+            self._radios.append((policy, radio))
+            layout.addWidget(radio)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self._on_accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _on_accept(self):
+        for policy, radio in self._radios:
+            if radio.isChecked():
+                self._policy = policy
+                break
+        self.accept()
+
+    def policy(self):
+        """選ばれたポリシー。キャンセルされたら None。"""
+        return self._policy
+
+
+class PropertiesDialog(QDialog):
+    """項目のプロパティ (簡易版)。フォルダのサイズは別スレッドで数える。"""
+
+    def __init__(self, path: str, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("プロパティ")
+        self.setMinimumWidth(420)
+
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+        layout.addLayout(form)
+
+        is_dir = os.path.isdir(path)
+        name = os.path.basename(os.path.normpath(path)) or path
+        form.addRow("名前:", QLabel(name))
+        form.addRow("パス:", QLabel(native(path)))
+        form.addRow("種類:", QLabel("フォルダ" if is_dir else "ファイル"))
+
+        self._size_label = QLabel("計算中..." if is_dir else file_ops.format_size(os.path.getsize(path)))
+        form.addRow("サイズ:", self._size_label)
+
+        try:
+            mtime = datetime.datetime.fromtimestamp(os.path.getmtime(path))
+            mtime_text = mtime.strftime("%Y-%m-%d %H:%M:%S")
+        except OSError:
+            mtime_text = "不明"
+        form.addRow("更新日時:", QLabel(mtime_text))
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok)
+        buttons.accepted.connect(self.accept)
+        layout.addWidget(buttons)
+
+        if is_dir:
+            start_folder_size_worker(path, self._on_size_ready)
+
+    def _on_size_ready(self, _path, size):
+        self._size_label.setText(f"{file_ops.format_size(size)}（フォルダ内の合計）")
+
+
 # ----------------------------------------------------------------------
 # ペイン本体
 # ----------------------------------------------------------------------
 class PaneWidget(QWidget):
     """左右独立して動作するデュアルペインの片側"""
 
+    path_changed = Signal(str)  # 表示中のフォルダが変わった (ツリー連動用)
+
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.setAttribute(Qt.WA_StyledBackground, True)  # アクティブ表示の枠線を有効にする
         self.opposite_pane: "PaneWidget | None" = None
         self._worker: "FileOperationWorker | None" = None
         self._progress: "QProgressDialog | None" = None
         self._operation = ("", "", False)  # (種類, 宛先, 終了後にクリップボードを空にするか)
+        self.pane_id = ""  # QSettings の保存先を分ける ID ("left" / "right")
+        self.show_hidden = False
+        self._view_widths = None  # 列幅 (全タブ共通・保存対象)
+        self._view_sort = None  # (列, 並び順) (全タブ共通・保存対象)
+        self._applying_view_settings = False
+        self._archive_worker: "ArchiveWorker | None" = None
+        self._archive_progress: "QProgressDialog | None" = None
+        self._archive_kind = ""
         self.init_ui()
 
     # ==================================================================
@@ -518,8 +839,10 @@ class PaneWidget(QWidget):
 
         self.tab_widget = QTabWidget()
         self.tab_widget.setTabsClosable(True)
+        self.tab_widget.setMovable(True)
         self.tab_widget.tabCloseRequested.connect(self.close_tab)
         self.tab_widget.currentChanged.connect(self._on_tab_changed)
+        self.tab_widget.tabBar().installEventFilter(self)  # 中クリックでタブを閉じる
         layout.addWidget(self.tab_widget)
 
         self.status_label = QLabel(STATUS_DEFAULT)
@@ -527,6 +850,18 @@ class PaneWidget(QWidget):
         layout.addWidget(self.status_label)
 
         self.add_new_tab("")
+
+    def eventFilter(self, obj, event):
+        if (
+            obj is self.tab_widget.tabBar()
+            and event.type() == QEvent.Type.MouseButtonRelease
+            and event.button() == Qt.MiddleButton
+        ):
+            index = self.tab_widget.tabBar().tabAt(event.pos())
+            if index >= 0:
+                self.close_tab(index)
+            return True
+        return super().eventFilter(obj, event)
 
     def _make_quick_button(self, label: str, path: str) -> QPushButton:
         button = QPushButton(label)
@@ -636,6 +971,22 @@ class PaneWidget(QWidget):
         """F5 / F6 の宛先になる反対側のペインを設定する（MainWindow が呼ぶ）"""
         self.opposite_pane = pane
 
+    def set_pane_id(self, pane_id: str):
+        """QSettings の保存先を分ける ID を設定する（MainWindow が呼ぶ）"""
+        self.pane_id = pane_id
+
+    @staticmethod
+    def _settings() -> QSettings:
+        return QSettings("KotaOkano", "NextGenFiler")
+
+    def _settings_prefix(self) -> str:
+        return f"pane/{self.pane_id}"
+
+    def set_active_indicator(self, active: bool):
+        """アクティブペインを枠線で示す (テーマに依らず分かるよう青い枠を使う)。"""
+        color = "#007acc" if active else "transparent"
+        self.setStyleSheet(f"PaneWidget {{ border: 2px solid {color}; }}")
+
     def get_opposite_pane_path(self) -> str:
         return self.opposite_pane.get_current_path() if self.opposite_pane else ""
 
@@ -654,6 +1005,108 @@ class PaneWidget(QWidget):
         self.path_input.setText(native(path) if path else PC_LABEL)
 
     # ==================================================================
+    # 設定の保存 / 復元 (QSettings)
+    # ==================================================================
+    def save_state(self):
+        """タブ構成と表示設定を保存する (アプリ終了時に MainWindow が呼ぶ)。"""
+        if not self.pane_id:
+            return
+        settings = self._settings()
+        prefix = self._settings_prefix()
+        paths = []
+        for i in range(self.tab_widget.count()):
+            tab = self.tab_widget.widget(i)
+            if isinstance(tab, FileTab):
+                paths.append(tab.current_path)
+        settings.setValue(f"{prefix}/tabs", paths)
+        settings.setValue(f"{prefix}/current_tab", self.tab_widget.currentIndex())
+        settings.setValue(f"{prefix}/show_hidden", self.show_hidden)
+        if self._view_widths:
+            settings.setValue(f"{prefix}/column_widths", self._view_widths)
+        if self._view_sort:
+            column, order = self._view_sort
+            settings.setValue(f"{prefix}/sort_column", column)
+            settings.setValue(f"{prefix}/sort_order", int(order))
+
+    def restore_state(self):
+        """保存されたタブ構成と表示設定を復元する (起動時に MainWindow が呼ぶ)。"""
+        if not self.pane_id:
+            return
+        settings = self._settings()
+        prefix = self._settings_prefix()
+        self.show_hidden = bool(settings.value(f"{prefix}/show_hidden", False, type=bool))
+        widths = settings.value(f"{prefix}/column_widths", [])
+        if widths:
+            self._view_widths = [int(w) for w in widths]
+        column = settings.value(f"{prefix}/sort_column", None)
+        if column is not None:
+            order = Qt.SortOrder(settings.value(f"{prefix}/sort_order", 0, type=int))
+            self._view_sort = (int(column), order)
+
+        paths = settings.value(f"{prefix}/tabs", [])
+        if isinstance(paths, str):
+            paths = [paths]
+        # 起動時に作られた既定のタブを取り除いてから復元する
+        while self.tab_widget.count():
+            widget = self.tab_widget.widget(0)
+            self.tab_widget.removeTab(0)
+            if widget is not None:
+                widget.deleteLater()
+        if paths:
+            for saved in paths:
+                self.add_new_tab(saved if saved and os.path.isdir(saved) else "")
+            current = settings.value(f"{prefix}/current_tab", 0, type=int)
+            if 0 <= current < self.tab_widget.count():
+                self.tab_widget.setCurrentIndex(current)
+        else:
+            self.add_new_tab("")
+        self._on_tab_changed(self.tab_widget.currentIndex())
+
+    def _on_header_changed(self, *_args):
+        """列幅やソートが変わったら、全タブに揃えて設定として保存する。"""
+        if self._applying_view_settings:
+            return
+        tab = self.current_tab()
+        if tab is None:
+            return
+        self._view_widths = tab.column_widths()
+        self._view_sort = tab.sort_state()
+        self._apply_view_settings(except_tab=tab)
+        if self.pane_id:
+            settings = self._settings()
+            prefix = self._settings_prefix()
+            settings.setValue(f"{prefix}/column_widths", self._view_widths)
+            column, order = self._view_sort
+            settings.setValue(f"{prefix}/sort_column", column)
+            settings.setValue(f"{prefix}/sort_order", int(order))
+
+    def _apply_view_settings(self, except_tab=None):
+        """保持している列幅・ソート・隠しファイル設定を各タブへ適用する。"""
+        self._applying_view_settings = True
+        try:
+            for i in range(self.tab_widget.count()):
+                tab = self.tab_widget.widget(i)
+                if not isinstance(tab, FileTab):
+                    continue
+                tab.set_show_hidden(self.show_hidden)
+                if tab is except_tab:
+                    continue
+                if self._view_widths:
+                    tab.apply_column_widths(self._view_widths)
+                if self._view_sort:
+                    tab.apply_sort(*self._view_sort)
+        finally:
+            self._applying_view_settings = False
+
+    def toggle_hidden_files(self):
+        """隠しファイルの表示 / 非表示を切り替える (Ctrl+H)。"""
+        self.show_hidden = not self.show_hidden
+        self._apply_view_settings()
+        self.set_status("隠しファイルを" + ("表示します" if self.show_hidden else "表示しません"))
+        if self.pane_id:
+            self._settings().setValue(f"{self._settings_prefix()}/show_hidden", self.show_hidden)
+
+    # ==================================================================
     # タブ
     # ==================================================================
     def add_new_tab(self, path: str = ""):
@@ -664,6 +1117,10 @@ class PaneWidget(QWidget):
         tab = FileTab(self, path, self.tab_widget)
         tab.selection_changed.connect(self.update_selection_stats)
         tab.view.doubleClicked.connect(self._on_item_double_clicked)
+        header = tab.view.horizontalHeader()
+        header.sectionResized.connect(self._on_header_changed)
+        header.sortIndicatorChanged.connect(self._on_header_changed)
+        self._apply_view_settings()  # 列幅・ソート・隠しファイル設定を引き継ぐ
 
         index = self.tab_widget.addTab(tab, tab_title(path))
         self.tab_widget.setCurrentIndex(index)
@@ -680,6 +1137,22 @@ class PaneWidget(QWidget):
         if widget is not None:
             widget.deleteLater()  # モデルごと解放する
 
+    def close_current_tab(self):
+        """Ctrl+W: 現在のタブを閉じる (最後の1つは閉じない)。"""
+        self.close_tab(self.tab_widget.currentIndex())
+
+    def activate_next_tab(self):
+        """Ctrl+Tab: 次のタブへ切り替える。"""
+        count = self.tab_widget.count()
+        if count > 1:
+            self.tab_widget.setCurrentIndex((self.tab_widget.currentIndex() + 1) % count)
+
+    def activate_previous_tab(self):
+        """Ctrl+Shift+Tab: 前のタブへ切り替える。"""
+        count = self.tab_widget.count()
+        if count > 1:
+            self.tab_widget.setCurrentIndex((self.tab_widget.currentIndex() - 1) % count)
+
     def _on_tab_changed(self, _index: int):
         tab = self.current_tab()
         if tab is None:
@@ -688,6 +1161,7 @@ class PaneWidget(QWidget):
         self.update_path_bar(tab.current_path)
         self._set_search_text(tab.filter_text)
         self.update_selection_stats()
+        self.path_changed.emit(tab.current_path)
 
     # ==================================================================
     # ナビゲーション
@@ -718,6 +1192,7 @@ class PaneWidget(QWidget):
         self.tab_widget.setTabText(self.tab_widget.currentIndex(), tab_title(path))
         self.update_selection_stats()
         self._update_nav_buttons()
+        self.path_changed.emit(path)
 
     def go_back(self):
         tab = self.current_tab()
@@ -866,6 +1341,18 @@ class PaneWidget(QWidget):
             parts.append(f"フォルダ {dirs}個")
         self.set_status(f"選択中: {' / '.join(parts)}  |  合計サイズ: {file_ops.format_size(total)}")
 
+        # フォルダが1つだけ選ばれているときは、中身の合計サイズも数えて表示する
+        selected = tab.selected_paths()
+        if dirs == 1 and files == 0 and len(selected) == 1:
+            self.set_status("選択中: フォルダ 1個  |  合計サイズ: 計算中...")
+            start_folder_size_worker(selected[0], self._on_folder_size_ready)
+
+    def _on_folder_size_ready(self, path: str, size: int):
+        tab = self.current_tab()
+        if tab is None or tab.selected_paths() != [path]:
+            return  # 選択が変わっていたら古い結果は捨てる
+        self.set_status(f"選択中: フォルダ 1個  |  合計サイズ: {file_ops.format_size(size)}")
+
     # ==================================================================
     # クリップボード（システムのクリップボードを唯一の情報源にする）
     # ==================================================================
@@ -921,6 +1408,108 @@ class PaneWidget(QWidget):
             return
 
         self._run_operation("move" if is_cut else "copy", paths, dest_dir, clear_clipboard=is_cut)
+
+    # ==================================================================
+    # ドラッグ＆ドロップの受け入れ
+    # ==================================================================
+    def accept_drop(self, paths: list, dest_dir: str, move: bool):
+        """ドロップされた項目を dest_dir へコピー / 移動する (ペイン間・エクスプローラー間共通)。"""
+        if not dest_dir or not os.path.isdir(dest_dir):
+            return
+        dest_abs = os.path.normcase(os.path.abspath(dest_dir))
+        targets = []
+        for p in paths:
+            if not p or not os.path.lexists(p):
+                continue
+            if os.path.normcase(os.path.dirname(os.path.abspath(p))) == dest_abs:
+                continue  # 同じフォルダへのドロップは何もしない
+            if os.path.isdir(p) and file_ops._is_inside(dest_dir, p):
+                continue  # フォルダを自分自身の中へは入れられない
+            targets.append(p)
+        if not targets:
+            self.set_status("ドロップできる項目がありませんでした")
+            return
+        self._run_operation("move" if move else "copy", targets, dest_dir)
+
+    # ==================================================================
+    # パスをコピー / プロパティ / ZIP
+    # ==================================================================
+    def copy_path_to_clipboard(self, path: str):
+        QGuiApplication.clipboard().setText(native(path))
+        self.set_status(f"パスをコピーしました: {native(path)}")
+
+    def show_properties(self, path: str):
+        if path:
+            PropertiesDialog(path, self).exec()
+
+    def compress_selected_to_zip(self):
+        """選択中の項目を、表示中のフォルダ内に ZIP 圧縮する。"""
+        tab = self.current_tab()
+        paths = tab.selected_paths() if tab else []
+        if not paths:
+            self._warn("圧縮する項目が選択されていません。")
+            return
+        dest_dir = self.get_current_path()
+        if not dest_dir or not os.path.isdir(dest_dir):
+            self._warn("圧縮先のフォルダが有効ではありません。（PCドライブ一覧では圧縮できません）")
+            return
+        self._run_archive("compress", paths, dest_dir)
+
+    def extract_zip_archive(self, archive: str):
+        """ZIP を表示中のフォルダへ展開する。"""
+        dest_dir = self.get_current_path()
+        if not dest_dir or not os.path.isdir(dest_dir):
+            self._warn("展開先のフォルダが有効ではありません。（PCドライブ一覧では展開できません）")
+            return
+        self._run_archive("extract", [], dest_dir, archive=archive)
+
+    def _run_archive(self, kind: str, paths: list, dest_dir: str, archive: str = ""):
+        if self._archive_worker is not None:
+            self.set_status("別の ZIP 処理が実行中です。完了までお待ちください。")
+            return
+        if self._worker is not None:
+            self.set_status("別のファイル操作が実行中です。完了までお待ちください。")
+            return
+
+        label = "圧縮" if kind == "compress" else "展開"
+        self._archive_kind = kind
+        progress = QProgressDialog(f"{label}を準備中...", "キャンセル", 0, 100, self)
+        progress.setWindowTitle(f"ZIP{label}")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(400)
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
+        progress.setValue(0)
+
+        worker = ArchiveWorker(kind, paths, dest_dir, archive, self)
+        worker.progressed.connect(progress.setValue)
+        worker.done.connect(self._on_archive_finished)
+        progress.canceled.connect(worker.cancel)
+
+        self._archive_worker, self._archive_progress = worker, progress
+        worker.start()
+
+    def _on_archive_finished(self, outcome):
+        ok, payload = outcome
+        worker, progress = self._archive_worker, self._archive_progress
+        self._archive_worker = self._archive_progress = None
+
+        if progress is not None:
+            progress.reset()
+            progress.hide()
+            progress.deleteLater()
+        if worker is not None:
+            worker.wait()
+            worker.deleteLater()
+
+        label = "圧縮" if self._archive_kind == "compress" else "展開"
+        if ok:
+            if self._archive_kind == "compress":
+                self.set_status(f"圧縮しました: {os.path.basename(payload)}")
+            else:
+                self.set_status(f"展開しました: {len(payload)} 件の項目")
+        else:
+            self._warn(f"ZIP の{label}に失敗しました:\n{payload}")
 
     # ==================================================================
     # 反対ペインへのコピー / 移動、削除
@@ -989,12 +1578,45 @@ class PaneWidget(QWidget):
     # ==================================================================
     # バックグラウンド実行
     # ==================================================================
+    def _ask_conflict_policy(self, paths: list, dest_dir: str):
+        """宛先に同名の項目がある場合に、どう扱うかをユーザーに選んでもらう。
+
+        衝突が無ければ既定の CONFLICT_RENAME、キャンセルされたら None を返す。
+        """
+        conflicts = [
+            p
+            for p in paths
+            if os.path.lexists(os.path.join(dest_dir, os.path.basename(os.path.normpath(p))))
+        ]
+        if not conflicts:
+            return file_ops.CONFLICT_RENAME
+        has_folder_conflict = any(
+            os.path.isdir(p)
+            and os.path.isdir(os.path.join(dest_dir, os.path.basename(os.path.normpath(p))))
+            for p in conflicts
+        )
+        dialog = ConflictDialog(conflicts, dest_dir, has_folder_conflict, self)
+        if dialog.exec() != QDialog.Accepted:
+            return None
+        return dialog.policy()
+
     def _run_operation(self, kind: str, paths: list, dest_dir: str = "", clear_clipboard: bool = False):
         if self._worker is not None:
             self.set_status("別のファイル操作が実行中です。完了までお待ちください。")
             return
+        if self._archive_worker is not None:
+            self.set_status("別の ZIP 処理が実行中です。完了までお待ちください。")
+            return
 
         label = OPERATION_LABELS[kind]
+
+        on_conflict = file_ops.CONFLICT_RENAME
+        if kind in ("copy", "move") and dest_dir:
+            on_conflict = self._ask_conflict_policy(paths, dest_dir)
+            if on_conflict is None:
+                self.set_status(f"{label}をキャンセルしました")
+                return
+
         self._operation = (kind, dest_dir, clear_clipboard)
 
         progress = QProgressDialog(f"{label}を準備中...", "キャンセル", 0, 100, self)
@@ -1005,7 +1627,7 @@ class PaneWidget(QWidget):
         progress.setAutoReset(False)
         progress.setValue(0)
 
-        worker = FileOperationWorker(kind, paths, dest_dir, self)
+        worker = FileOperationWorker(kind, paths, dest_dir, self, on_conflict=on_conflict)
         worker.progressed.connect(self._on_operation_progress)
         worker.overall.connect(progress.setValue)
         worker.done.connect(self._on_operation_finished)
@@ -1039,6 +1661,9 @@ class PaneWidget(QWidget):
 
         label = OPERATION_LABELS[kind]
         parts = [f"{result.success_count} 件を{label}しました"]
+        skipped = getattr(result, "skipped", [])
+        if skipped:
+            parts.append(f"スキップ {len(skipped)} 件")
         if result.failed:
             parts.append(f"失敗 {len(result.failed)} 件")
         if result.cancelled:

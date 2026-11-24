@@ -28,7 +28,14 @@ class CustomTreeView(QTreeView):
 
     def mouseReleaseEvent(self, event: QMouseEvent):
         super().mouseReleaseEvent(event)
-        
+
+        if event.button() == Qt.LeftButton:
+            # 左クリックでフォルダを選んだら、アクティブペインがそのフォルダへ移動する
+            index = self.indexAt(event.pos())
+            if index.isValid() and self.model().isDir(index):
+                self.open_in_pane_signal.emit(self.model().filePath(index), "active")
+            return
+
         if event.button() == Qt.RightButton:
             index = self.indexAt(event.pos())
             if index.isValid():
@@ -85,7 +92,12 @@ class TreeSidebar(QWidget):
         layout.addWidget(self.tree_view)
 
     def select_path(self, path: str):
+        """ペインの現在地にツリーの選択を合わせる (親フォルダを展開して表示する)。"""
         index = self.model.index(path)
         if index.isValid():
+            parent = index.parent()
+            while parent.isValid():
+                self.tree_view.expand(parent)
+                parent = parent.parent()
             self.tree_view.setCurrentIndex(index)
             self.tree_view.scrollTo(index)

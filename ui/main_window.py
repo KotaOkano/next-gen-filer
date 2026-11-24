@@ -1,4 +1,4 @@
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QSettings, Qt
 from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
@@ -12,6 +12,7 @@ from PySide6.QtWidgets import (
 )
 
 from version import __version__
+from ui.app_icon import create_app_icon
 from ui.disk_analyzer import get_drive_space_info
 from ui.file_tools_dialog import FileToolsDialog
 from ui.pane_widget import PaneWidget
@@ -25,10 +26,36 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(f"Next-Gen File Manager v{__version__}")
+        self.setWindowIcon(create_app_icon())
         self.resize(1200, 800)
 
         self.init_ui()
+        self._restore_window_state()
         self.init_shortcuts()
+
+    # ------------------------------------------------------------------
+    # 設定の保存 / 復元 (QSettings)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _settings() -> QSettings:
+        return QSettings("KotaOkano", "NextGenFiler")
+
+    def _restore_window_state(self):
+        settings = self._settings()
+        geometry = settings.value("window/geometry")
+        if geometry is not None:
+            self.restoreGeometry(geometry)
+        splitter_state = settings.value("window/splitter")
+        if splitter_state is not None:
+            self.splitter.restoreState(splitter_state)
+
+    def closeEvent(self, event):
+        settings = self._settings()
+        settings.setValue("window/geometry", self.saveGeometry())
+        settings.setValue("window/splitter", self.splitter.saveState())
+        self.left_pane.save_state()
+        self.right_pane.save_state()
+        super().closeEvent(event)
 
     # ------------------------------------------------------------------
     # UI構築
@@ -82,6 +109,12 @@ class MainWindow(QMainWindow):
         # F5 / F6 の宛先として、お互いを教えておく
         self.left_pane.set_opposite_pane(self.right_pane)
         self.right_pane.set_opposite_pane(self.left_pane)
+        # QSettings の保存先を分けるための ID
+        self.left_pane.set_pane_id("left")
+        self.right_pane.set_pane_id("right")
+        # ペインの現在地が変わったらツリーの選択を連動させる
+        self.left_pane.path_changed.connect(self._sync_tree_to_pane)
+        self.right_pane.path_changed.connect(self._sync_tree_to_pane)
 
         self.splitter.addWidget(self.tree_sidebar)
         self.splitter.addWidget(self.left_pane)
@@ -91,6 +124,12 @@ class MainWindow(QMainWindow):
         # 最後にフォーカスのあったペインを覚えておく（ツリーやダイアログにフォーカスが移っても迷わない）
         self._active_pane = self.left_pane
         QApplication.instance().focusChanged.connect(self._on_focus_changed)
+
+        # 前回のタブ構成・表示設定を復元する
+        self.left_pane.restore_state()
+        self.right_pane.restore_state()
+        self.left_pane.set_active_indicator(True)
+        self.right_pane.set_active_indicator(False)
         return self.splitter
 
     def init_shortcuts(self):
@@ -109,16 +148,40 @@ class MainWindow(QMainWindow):
             return
         for pane in (self.left_pane, self.right_pane):
             if pane is new or pane.isAncestorOf(new):
-                self._active_pane = pane
+                if self._active_pane is not pane:
+                    self._active_pane = pane
+                    self.left_pane.set_active_indicator(pane is self.left_pane)
+                    self.right_pane.set_active_indicator(pane is self.right_pane)
+                    path = pane.get_current_path()
+                    if path:
+                        self.tree_sidebar.select_path(path)
                 return
+
+    def _sync_tree_to_pane(self, path: str):
+        """アクティブペインの現在地にツリーの選択を合わせる。"""
+        if not path:
+            return
+        sender_pane = self.sender()
+        if sender_pane is not None and sender_pane is not self._active_pane:
+            return
+        self.tree_sidebar.select_path(path)
 
     def get_active_pane(self) -> PaneWidget:
         """最後にフォーカスのあったペインを返す（最初は左ペイン）"""
         return self._active_pane
 
     def handle_tree_navigation(self, path: str, pane_side: str):
-        """ツリーのメニュー選択に応じて、左または右のペインで（現在のタブの）フォルダを開く"""
-        target_pane = self.left_pane if pane_side == "left" else self.right_pane
+        """ツリーの選択に応じてペインでフォルダを開く。
+
+        pane_side が "left" / "right" ならそのペイン、"active" (左クリック) なら
+        アクティブペインが対象になる。
+        """
+        if pane_side == "left":
+            target_pane = self.left_pane
+        elif pane_side == "right":
+            target_pane = self.right_pane
+        else:
+            target_pane = self.get_active_pane()
         target_pane.navigate_to_path(path)
 
     # ------------------------------------------------------------------
