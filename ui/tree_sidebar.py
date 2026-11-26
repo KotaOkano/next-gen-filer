@@ -1,5 +1,5 @@
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QTreeView, QFileSystemModel, QMenu
-from PySide6.QtCore import QDir, QModelIndex, Signal, Qt
+from PySide6.QtCore import QDir, QModelIndex, QPersistentModelIndex, Signal, Qt
 from PySide6.QtGui import QCursor, QMouseEvent
 
 class EditableFileSystemModel(QFileSystemModel):
@@ -10,8 +10,9 @@ class EditableFileSystemModel(QFileSystemModel):
 
 class CustomTreeView(QTreeView):
     """
+    - 左クリック: ペインは移動せず、フォルダの展開 / 折りたたみと選択のみ
     - ダブルクリック: 名前の変更はせず、通常のツリー展開・選択のみ
-    - 右クリック1回: 左右ペイン選択 ＋ 名前の変更メニューを表示
+    - 右クリック1回: 左右ペインの新しいタブで開く ＋ 名前の変更メニューを表示
     - Ctrl + Enter / F2: インラインリネーム開始
     """
     open_in_pane_signal = Signal(str, str)
@@ -26,14 +27,38 @@ class CustomTreeView(QTreeView):
         for i in range(1, model.columnCount()):
             self.setColumnHidden(i, True)
 
+        # 左クリック押下時点のインデックスと展開状態 (離した時の開閉判定に使う)
+        self._press_index = QPersistentModelIndex()
+        self._press_expanded = False
+
+    def mousePressEvent(self, event: QMouseEvent):
+        if event.button() == Qt.LeftButton:
+            index = self.indexAt(event.pos())
+            self._press_index = QPersistentModelIndex(index)
+            self._press_expanded = index.isValid() and self.isExpanded(index)
+        super().mousePressEvent(event)
+
     def mouseReleaseEvent(self, event: QMouseEvent):
         super().mouseReleaseEvent(event)
 
         if event.button() == Qt.LeftButton:
-            # 左クリックでフォルダを選んだら、アクティブペインがそのフォルダへ移動する
+            # 左クリックではペインを移動しない。フォルダの展開 / 折りたたみだけを行う
             index = self.indexAt(event.pos())
-            if index.isValid() and self.model().isDir(index):
-                self.open_in_pane_signal.emit(self.model().filePath(index), "active")
+            press_index = QModelIndex(self._press_index)
+            self._press_index = QPersistentModelIndex()
+            if (
+                index.isValid()
+                and press_index.isValid()
+                and index == press_index
+                and self.model().isDir(index)
+                and self.isExpanded(index) == self._press_expanded
+            ):
+                # 展開インジケータのクリックは押下時に既定動作で開閉済みなので、
+                # 状態が変わっていない (項目本体のクリック) 場合だけここで開閉する
+                if self.isExpanded(index):
+                    self.collapse(index)
+                else:
+                    self.expand(index)
             return
 
         if event.button() == Qt.RightButton:
@@ -47,8 +72,8 @@ class CustomTreeView(QTreeView):
                 action_left = None
                 action_right = None
                 if model.isDir(index):
-                    action_left = menu.addAction("📁 左ペインで開く")
-                    action_right = menu.addAction("📁 右ペインで開く")
+                    action_left = menu.addAction("📁 左ペインで開く（新しいタブ）")
+                    action_right = menu.addAction("📁 右ペインで開く（新しいタブ）")
                     menu.addSeparator()
                 
                 action_rename = menu.addAction("✏️ 名前の変更 (F2 / Ctrl+Enter)")

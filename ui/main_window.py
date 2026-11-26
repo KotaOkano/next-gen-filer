@@ -171,18 +171,31 @@ class MainWindow(QMainWindow):
         return self._active_pane
 
     def handle_tree_navigation(self, path: str, pane_side: str):
-        """ツリーの選択に応じてペインでフォルダを開く。
+        """ツリーの右クリックから、指定したペインの新しいタブでフォルダを開く。
 
-        pane_side が "left" / "right" ならそのペイン、"active" (左クリック) なら
-        アクティブペインが対象になる。
+        開いたペインがそのままアクティブペインになる。
         """
         if pane_side == "left":
             target_pane = self.left_pane
         elif pane_side == "right":
             target_pane = self.right_pane
         else:
-            target_pane = self.get_active_pane()
-        target_pane.navigate_to_path(path)
+            return
+        target_pane.add_new_tab(path)
+        self._activate_pane(target_pane)
+
+    def _activate_pane(self, pane: PaneWidget):
+        """指定したペインをアクティブペインにし、フォーカスを移す。"""
+        if self._active_pane is not pane:
+            self._active_pane = pane
+            self.left_pane.set_active_indicator(pane is self.left_pane)
+            self.right_pane.set_active_indicator(pane is self.right_pane)
+        tab = pane.current_tab()
+        if tab is not None:
+            tab.view.setFocus()
+        path = pane.get_current_path()
+        if path:
+            self.tree_sidebar.select_path(path)
 
     # ------------------------------------------------------------------
     # ショートカットのハンドラ
