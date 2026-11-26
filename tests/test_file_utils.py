@@ -386,3 +386,23 @@ class ShredTests(FileUtilsTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class IterationLimitTests(FileUtilsTestCase):
+    """v1.3.0: 暗号化側の反復回数にも上限を適用する (復号側の検証と一致)。"""
+
+    def test_iterations_above_max_is_rejected_on_encrypt(self):
+        src = self.make_file("a.bin", b"data")
+        with self.assertRaises(ValueError):
+            file_utils.encrypt_file(src, "pw", iterations=file_utils.MAX_ITERATIONS + 1)
+
+    def test_iterations_below_min_is_rejected_on_encrypt(self):
+        src = self.make_file("a.bin", b"data")
+        with self.assertRaises(ValueError):
+            file_utils.encrypt_file(src, "pw", iterations=file_utils.MIN_ITERATIONS - 1)
+
+    def test_round_trip_still_works(self):
+        src = self.make_file("a.bin", b"data")
+        enc = self.encrypt(src)
+        out = file_utils.decrypt_file(enc, "pw-for-test")
+        self.assertEqual(read_bytes(out), b"data")

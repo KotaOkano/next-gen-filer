@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import datetime
+import hashlib
 import os
 import shutil
 import stat
@@ -16,6 +18,13 @@ except ImportError:  # pragma: no cover - 環境による
 TRASH_AVAILABLE = _send2trash is not None
 
 COPY_CHUNK_SIZE = 1024 * 1024  # チャンクコピーの読み書き単位 (1 MiB)
+
+# ZIP 展開の安全上限 (いわゆる ZIP 爆弾対策)。圧縮率による判定は、正規の
+# ディスクイメージなど極端に圧縮率の高い正当なファイルでも誤判定するため
+# 行わず、項目数・申告サイズ・実際に書き出したバイト数で制限する。
+MAX_ZIP_ENTRIES = 100_000  # 展開できる ZIP 内の項目数の上限
+MAX_ZIP_FILE_SIZE = 32 * 1024 ** 3  # 展開できる 1 項目あたりの展開後サイズの上限 (32 GiB)
+MAX_ZIP_TOTAL_SIZE = 100 * 1024 ** 3  # 展開できる ZIP 全体の展開後サイズの上限 (100 GiB)
 
 
 class OperationCancelled(Exception):
@@ -555,6 +564,75 @@ def create_zip(
     return dest
 
 
+def _realpath_inside(path: str, real_parent: str) -> bool:
+    """path の実パス (シンボリックリンク解決後) が real_parent の内側にあるか。
+
+    real_parent は呼び出し側で os.path.realpath 済みの前提。展開先自体が
+    シンボリックリンクやジャンクション経由のパスでも正しく判定でき、
+    逆に展開先の中にあるリンクを経由して外へ出るパスは検出できる。
+    """
+    real = os.path.normcase(os.path.realpath(path))
+    try:
+        return os.path.commonpath([real_parent, real]) == real_parent
+    except ValueError:  # ドライブが異なる
+        return False
+
+
+def _check_zip_extract_limits(infos: list, dest_dir: str) -> int:
+    """ZIP 展開前の安全チェックを行い、申告された展開後合計サイズを返す。
+
+    項目数・1 項目あたりのサイズ・合計サイズが上限を超える場合、または
+    申告サイズの合計が展開先ドライブの空き容量を超える場合は、
+    何も書き込まずに ValueError を送出する。
+    """
+    if len(infos) > MAX_ZIP_ENTRIES:
+        raise ValueError(
+            f"ZIP 内の項目数が上限を超えています ({len(infos)} 件 > {MAX_ZIP_ENTRIES} 件)"
+        )
+    for info in infos:
+        if info.file_size > MAX_ZIP_FILE_SIZE:
+            raise ValueError(
+                "ZIP 内の項目の展開後サイズが上限を超えています "
+                f"({info.filename}: {format_size(info.file_size)} > 上限 {format_size(MAX_ZIP_FILE_SIZE)})"
+            )
+    total = sum(info.file_size for info in infos)
+    if total > MAX_ZIP_TOTAL_SIZE:
+        raise ValueError(
+            "ZIP の展開後合計サイズが上限を超えています "
+            f"({format_size(total)} > 上限 {format_size(MAX_ZIP_TOTAL_SIZE)})"
+        )
+    free = shutil.disk_usage(dest_dir).free
+    if total > free:
+        raise ValueError(
+            "展開後の合計サイズが展開先の空き容量を超えています "
+            f"(展開後サイズ: {format_size(total)} / 空き容量: {format_size(free)})"
+        )
+    return total
+
+
+def _copy_zip_entry(inp, out, max_bytes: int, is_cancelled: Optional[CancelCallback]) -> int:
+    """ZIP の1項目分のデータを out へ書き出し、実際に書いたバイト数を返す。
+
+    実際に読み出せたバイト数が max_bytes (ヘッダーの申告サイズ) を超えたら、
+    申告を詐称する不正な ZIP とみなして ValueError を送出する。
+    """
+    written = 0
+    while True:
+        _check_cancelled(is_cancelled)
+        chunk = inp.read(COPY_CHUNK_SIZE)
+        if not chunk:
+            break
+        written += len(chunk)
+        if written > max_bytes:
+            raise ValueError(
+                "ZIP 内のデータが申告サイズより大きいため、展開を中止しました "
+                f"(申告サイズ: {format_size(max_bytes)} / "
+                f"実際に読み出したサイズ: {format_size(written)})"
+            )
+        out.write(chunk)
+    return written
+
+
 def extract_zip(
     archive: str,
     dest_dir: str,
@@ -564,19 +642,24 @@ def extract_zip(
     """ZIP を dest_dir へ展開し、展開したトップレベル項目のパスのリストを返す。
 
     既存のファイルは上書きする。ZIP 内のパスが dest_dir の外を指す項目 (Zip Slip) は
-    展開しない。キャンセル時は展開済みのファイルが残ることがある。
+    展開しない。展開先の中にシンボリックリンクがある場合も、そのリンクを経由して
+    外へ書き込む項目は展開しない (書き込み直前に実パスで確認する)。
+    項目数・展開後サイズには安全上限があり、超過する ZIP は展開しない。
+    キャンセル時は展開済みのファイルが残ることがある。
     """
     _require_exists(archive)
     if not os.path.isdir(dest_dir):
         raise FileNotFoundError(f"展開先のフォルダが見つかりません: {dest_dir}")
     dest_abs = os.path.abspath(dest_dir)
+    dest_real = os.path.normcase(os.path.realpath(dest_abs))
 
     created: list = []
     seen_top: set = set()
     with zipfile.ZipFile(archive) as zf:
         infos = zf.infolist()
-        total = sum(info.file_size for info in infos)
+        total = _check_zip_extract_limits(infos, dest_abs)
         done = 0
+        written_total = 0
         for info in infos:
             _check_cancelled(is_cancelled)
             parts = [p for p in info.filename.replace("\\", "/").split("/") if p not in ("", ".")]
@@ -587,6 +670,9 @@ def extract_zip(
             if os.path.normcase(target) != os.path.normcase(dest_abs) and not _is_inside(target, dest_abs):
                 done += info.file_size
                 continue
+            if not _realpath_inside(target, dest_real):
+                done += info.file_size
+                continue  # リンク経由で展開先の外へ出る項目は展開しない
             top = os.path.join(dest_abs, parts[0])
             if parts[0] not in seen_top:
                 seen_top.add(parts[0])
@@ -594,14 +680,25 @@ def extract_zip(
             if info.is_dir():
                 os.makedirs(target, exist_ok=True)
             else:
-                os.makedirs(os.path.dirname(target), exist_ok=True)
-                with zf.open(info) as inp, open(target, "wb") as out:
-                    while True:
-                        _check_cancelled(is_cancelled)
-                        chunk = inp.read(COPY_CHUNK_SIZE)
-                        if not chunk:
-                            break
-                        out.write(chunk)
+                parent_dir = os.path.dirname(target)
+                os.makedirs(parent_dir, exist_ok=True)
+                # 書き込み直前に親フォルダの実パスを再確認する (リンク対策)
+                if not _realpath_inside(parent_dir, dest_real):
+                    done += info.file_size
+                    continue
+                try:
+                    with zf.open(info) as inp, open(target, "wb") as out:
+                        written_total += _copy_zip_entry(inp, out, info.file_size, is_cancelled)
+                except ValueError:
+                    _remove_quietly(target)  # 申告詐称が判明した書きかけを残さない
+                    raise
+                if written_total > total:
+                    _remove_quietly(target)
+                    raise ValueError(
+                        "ZIP の展開サイズが申告された合計を超えたため、展開を中止しました "
+                        f"(申告合計: {format_size(total)} / "
+                        f"実際の展開サイズ: {format_size(written_total)})"
+                    )
                 try:
                     import datetime
 
@@ -615,3 +712,186 @@ def extract_zip(
     if progress is not None and total == 0:
         progress(0, 0)
     return created
+
+
+# ----------------------------------------------------------------------
+# ZIP の中身の参照 (アーカイブ表示用)
+# ----------------------------------------------------------------------
+@dataclass
+class ArchiveEntry:
+    """ZIP 内の1項目 (list_zip_entries が返す、1階層分の表示用情報)。"""
+
+    name: str  # この階層での表示名
+    inner_path: str  # ZIP 内のパス ("/" 区切り。フォルダでも末尾に "/" は付けない)
+    is_dir: bool
+    size: int  # ファイルサイズ (フォルダは 0)
+    modified: Optional[datetime.datetime] = None  # 更新日時 (暗黙のフォルダは None)
+
+
+def _zip_entry_parts(filename: str) -> list:
+    """ZIP 内の名前をパーツに分解する。外側を指す要素を含む場合は空リスト (不正)。"""
+    parts = [p for p in filename.replace("\\", "/").split("/") if p not in ("", ".")]
+    if any(p == ".." for p in parts):
+        return []
+    return parts
+
+
+def list_zip_entries(archive: str, inner_dir: str = "") -> list:
+    """ZIP の inner_dir 直下の項目を ArchiveEntry のリストで返す。
+
+    フォルダは、ZIP 内に明示的なフォルダ項目が無くてもファイルのパスから
+    補って返す (暗黙のフォルダ)。並びはフォルダを先頭に、名前順。
+    inner_dir が存在しない場合は空リストを返す。
+    """
+    _require_exists(archive)
+    prefix = [p for p in inner_dir.replace("\\", "/").split("/") if p not in ("", ".")]
+    if any(p == ".." for p in prefix):
+        raise ValueError(f"不正な ZIP 内パスです: {inner_dir}")
+
+    found: dict = {}  # 表示名 -> ArchiveEntry
+    with zipfile.ZipFile(archive) as zf:
+        for info in zf.infolist():
+            parts = _zip_entry_parts(info.filename)
+            if not parts or parts[: len(prefix)] != prefix:
+                continue
+            rest = parts[len(prefix):]
+            if not rest:
+                continue  # inner_dir 自身のフォルダ項目
+            name = rest[0]
+            if len(rest) > 1 or info.is_dir():
+                # フォルダ (明示的なフォルダ項目、またはファイルパスから補う暗黙のフォルダ)
+                if name not in found:
+                    modified = None
+                    if len(rest) == 1 and info.is_dir():
+                        try:
+                            modified = datetime.datetime(*info.date_time)
+                        except ValueError:
+                            modified = None
+                    found[name] = ArchiveEntry(
+                        name=name,
+                        inner_path="/".join(prefix + [name]),
+                        is_dir=True,
+                        size=0,
+                        modified=modified,
+                    )
+            else:
+                try:
+                    modified = datetime.datetime(*info.date_time)
+                except ValueError:
+                    modified = None
+                found[name] = ArchiveEntry(
+                    name=name,
+                    inner_path="/".join(parts),
+                    is_dir=False,
+                    size=info.file_size,
+                    modified=modified,
+                )
+    return sorted(found.values(), key=lambda e: (not e.is_dir, e.name.casefold()))
+
+
+def extract_zip_entry(archive: str, inner_path: str, dest_dir: Optional[str] = None) -> str:
+    """ZIP 内のファイル1つを dest_dir へ展開し、そのパスを返す。
+
+    dest_dir を省略すると一時フォルダを新しく作る (アーカイブ表示から開く用)。
+    ZIP 内パスが dest_dir の外を指す場合は展開しない (Zip Slip 対策)。
+    展開先の中のシンボリックリンクを経由して外へ書き込む場合も展開しない。
+    項目の申告サイズが上限 (MAX_ZIP_FILE_SIZE) を超える場合も展開しない。
+    """
+    _require_exists(archive)
+    parts = _zip_entry_parts(inner_path)
+    if not parts:
+        raise ValueError(f"不正な ZIP 内パスです: {inner_path}")
+    if dest_dir is None:
+        dest_dir = tempfile.mkdtemp(prefix="nextgenfiler-zip-")
+    dest_abs = os.path.abspath(dest_dir)
+    dest_real = os.path.normcase(os.path.realpath(dest_abs))
+    target = os.path.join(dest_abs, *parts)
+    if not _is_inside(target, dest_abs):
+        raise ValueError(f"展開先がフォルダの外になります: {inner_path}")
+    if not _realpath_inside(target, dest_real):
+        raise ValueError(f"展開先がフォルダの外になります: {inner_path}")
+
+    with zipfile.ZipFile(archive) as zf:
+        wanted = "/".join(parts)
+        info = None
+        for candidate in zf.infolist():
+            if not candidate.is_dir() and "/".join(_zip_entry_parts(candidate.filename)) == wanted:
+                info = candidate
+                break
+        if info is None:
+            raise FileNotFoundError(f"ZIP 内に見つかりません: {inner_path}")
+        if info.file_size > MAX_ZIP_FILE_SIZE:
+            raise ValueError(
+                "項目の展開後サイズが上限を超えています "
+                f"({format_size(info.file_size)} > 上限 {format_size(MAX_ZIP_FILE_SIZE)})"
+            )
+        parent_dir = os.path.dirname(target)
+        os.makedirs(parent_dir, exist_ok=True)
+        # 書き込み直前に親フォルダの実パスを再確認する (リンク対策)
+        if not _realpath_inside(parent_dir, dest_real):
+            raise ValueError(f"展開先がフォルダの外になります: {inner_path}")
+        try:
+            with zf.open(info) as inp, open(target, "wb") as out:
+                _copy_zip_entry(inp, out, info.file_size, None)
+        except ValueError:
+            _remove_quietly(target)  # 申告詐称が判明した書きかけを残さない
+            raise
+        try:
+            mtime = datetime.datetime(*info.date_time).timestamp()
+            os.utime(target, (mtime, mtime))
+        except (OSError, ValueError, OverflowError):
+            pass
+    return target
+
+
+# ----------------------------------------------------------------------
+# ハッシュ計算
+# ----------------------------------------------------------------------
+HASH_ALGORITHMS = ("sha256", "md5", "sha1", "sha512")  # 既定は SHA-256
+
+
+def compute_file_hash(
+    path: str,
+    algorithm: str = "sha256",
+    progress: Optional[ProgressCallback] = None,
+    is_cancelled: Optional[CancelCallback] = None,
+) -> str:
+    """ファイルのハッシュ値を16進文字列で返す。
+
+    チャンク読みするので、大きなファイルでもメモリを食わず UI も固まらない
+    (呼び出し側は別スレッドで実行すること)。キャンセル時は OperationCancelled。
+    """
+    _require_exists(path)
+    try:
+        hasher = hashlib.new(algorithm)
+    except (ValueError, TypeError):
+        raise ValueError(f"未対応のハッシュアルゴリズムです: {algorithm}") from None
+    total = os.path.getsize(path)
+    done = 0
+    with open(path, "rb") as stream:
+        while True:
+            _check_cancelled(is_cancelled)
+            chunk = stream.read(COPY_CHUNK_SIZE)
+            if not chunk:
+                break
+            hasher.update(chunk)
+            done += len(chunk)
+            if progress is not None:
+                progress(done, total)
+    if progress is not None and total == 0:
+        progress(0, 0)
+    return hasher.hexdigest()
+
+
+def normalize_hash_text(text: str) -> str:
+    """照合用にハッシュ文字列を正規化する (空白・改行を取り除き、小文字にする)。"""
+    return "".join((text or "").split()).lower()
+
+
+def hash_matches(computed: str, expected: str) -> bool:
+    """計算したハッシュと期待値が一致するか。期待値が空なら False。
+
+    大文字小文字を区別せず、空白・改行は無視する (公式サイトのコピペ対策)。
+    """
+    expected_norm = normalize_hash_text(expected)
+    return bool(expected_norm) and expected_norm == normalize_hash_text(computed)

@@ -23,7 +23,15 @@ from PySide6.QtCore import (
     QUrl,
     Signal,
 )
-from PySide6.QtGui import QAction, QDesktopServices, QDrag, QGuiApplication, QKeyEvent
+from PySide6.QtGui import (
+    QAction,
+    QDesktopServices,
+    QDrag,
+    QGuiApplication,
+    QKeyEvent,
+    QStandardItem,
+    QStandardItemModel,
+)
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QDialog,
@@ -51,6 +59,7 @@ except ImportError:
 from core import file_ops
 from core.size_worker import FolderSizeWorker
 from ui.batch_rename_dialog import BatchRenameDialog
+from ui.hash_dialog import HashDialog
 from ui.quick_look_dialog import QuickLookDialog
 
 # ----------------------------------------------------------------------
@@ -143,9 +152,42 @@ def parse_user_path(text: str) -> str:
     return normalize_path(os.path.expandvars(os.path.expanduser(text)))
 
 
+# ----------------------------------------------------------------------
+# ZIP アーカイブ表示用の仮想パス
+# ----------------------------------------------------------------------
+# アーカイブ表示中のタブは、現在地を "<ZIP の実パス>!<ZIP 内パス>" という
+# 仮想パスで表す (例: "C:/data/a.zip!/sub")。履歴やタブ復元はこの文字列で扱う。
+def archive_virtual_path(archive: str, inner: str = "") -> str:
+    inner = (inner or "").strip("/")
+    return f"{archive}!/{inner}" if inner else f"{archive}!"
+
+
+def split_archive_path(path: str):
+    """仮想パスなら (ZIP の実パス, ZIP 内パス) を返す。通常のパスなら None。
+
+    "!" を含む通常のパスと誤判定しないよう、前半が実在する .zip ファイルの
+    ときだけ仮想パスとみなす。
+    """
+    if not path or "!" not in path:
+        return None
+    start = 0
+    while True:
+        idx = path.find("!", start)
+        if idx < 0:
+            return None
+        head = path[:idx]
+        if head.lower().endswith(".zip") and os.path.isfile(head):
+            return head, path[idx + 1:].strip("/")
+        start = idx + 1
+
+
 def tab_title(path: str) -> str:
     if not path:
         return "PC"
+    parsed = split_archive_path(path)
+    if parsed is not None:
+        archive, inner = parsed
+        return os.path.basename(inner) if inner else os.path.basename(archive)
     return os.path.basename(path.rstrip("/")) or path
 
 
@@ -202,6 +244,63 @@ class FileSortFilterProxyModel(QSortFilterProxyModel):
                 return a < b
 
         return _natural_key(model.fileName(left)) < _natural_key(model.fileName(right))
+
+
+# アーカイブ表示モデルのアイテム (名前の列) に持たせるデータの役割
+ROLE_IS_DIR = Qt.UserRole
+ROLE_SIZE = Qt.UserRole + 1
+ROLE_MODIFIED = Qt.UserRole + 2
+ROLE_INNER = Qt.UserRole + 3
+ROLE_TYPE = Qt.UserRole + 4
+
+
+class ArchiveSortFilterProxyModel(QSortFilterProxyModel):
+    """ZIP 内一覧用のプロキシ (フォルダを常に先頭にし、サイズ・日時を値で並べ替える)。"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFilterCaseSensitivity(Qt.CaseInsensitive)
+        self.setFilterKeyColumn(0)  # ファイル名の列で絞り込む
+
+    @staticmethod
+    def _name_item(model, row):
+        return model.item(row, 0) if model is not None else None
+
+    def filterAcceptsRow(self, source_row, source_parent):
+        item = self._name_item(self.sourceModel(), source_row)
+        if item is not None and item.data(ROLE_IS_DIR):
+            return True  # フォルダは絞り込み中も常に表示する
+        return super().filterAcceptsRow(source_row, source_parent)
+
+    def lessThan(self, left, right):
+        model = self.sourceModel()
+        li = self._name_item(model, left.row())
+        ri = self._name_item(model, right.row())
+        if li is None or ri is None:
+            return super().lessThan(left, right)
+
+        left_dir, right_dir = bool(li.data(ROLE_IS_DIR)), bool(ri.data(ROLE_IS_DIR))
+        if left_dir != right_dir:
+            # フォルダを常に先頭に保つ (FileSortFilterProxyModel と同じ考え方)
+            return left_dir if self.sortOrder() == Qt.AscendingOrder else not left_dir
+
+        column = self.sortColumn()
+        if column == 1:  # サイズ
+            a, b = li.data(ROLE_SIZE) or 0, ri.data(ROLE_SIZE) or 0
+            if a != b:
+                return a < b
+        elif column == 2:  # 種類
+            a, b = (li.data(ROLE_TYPE) or "").casefold(), (ri.data(ROLE_TYPE) or "").casefold()
+            if a != b:
+                return a < b
+        elif column == 3:  # 更新日時
+            a, b = li.data(ROLE_MODIFIED), ri.data(ROLE_MODIFIED)
+            a = -1.0 if a is None else a
+            b = -1.0 if b is None else b
+            if a != b:
+                return a < b
+
+        return _natural_key(li.text()) < _natural_key(ri.text())
 
 
 # ----------------------------------------------------------------------
@@ -273,12 +372,23 @@ class InteractiveTableView(QTableView):
         super().keyPressEvent(event)
 
     # ---- 名前の変更 --------------------------------------------------
+    def _tab(self) -> "FileTab | None":
+        parent = self.parent()
+        return parent if isinstance(parent, FileTab) else None
+
     def _path_of(self, index: QModelIndex) -> str:
+        tab = self._tab()
+        if tab is not None:
+            return tab.path_at(index)
         proxy = self.model()
         return proxy.sourceModel().filePath(proxy.mapToSource(index))
 
     def rename_index(self, index: QModelIndex):
         if not index.isValid():
+            return
+        tab = self._tab()
+        if tab is not None and tab.in_archive:
+            self.pane.set_status("アーカイブ内では名前を変更できません")
             return
         index = index.siblingAtColumn(0)  # 名前の列だけが編集できる
         path = self._path_of(index)
@@ -309,6 +419,8 @@ class InteractiveTableView(QTableView):
 
     def _start_drag(self, modifiers):
         tab = self.pane.current_tab()
+        if tab is not None and tab.in_archive:
+            return  # アーカイブ内の項目はドラッグできない (読み取り専用)
         paths = tab.selected_paths() if tab else []
         if not paths:
             return
@@ -330,8 +442,8 @@ class InteractiveTableView(QTableView):
     def _drop_target_dir(self, pos):
         """ドロップ先フォルダを返す。フォルダ行の上ならそのフォルダ、それ以外は表示中のフォルダ。"""
         tab = self.pane.current_tab()
-        if tab is None:
-            return None
+        if tab is None or tab.in_archive:
+            return None  # アーカイブ内へはドロップできない
         index = self.indexAt(pos)
         if index.isValid():
             path = self._path_of(index)
@@ -365,8 +477,30 @@ class InteractiveTableView(QTableView):
         self.pane.accept_drop(paths, dest_dir, move)
 
     # ---- 右クリックメニュー ------------------------------------------
+    def _show_archive_context_menu(self, pos, tab):
+        """アーカイブ表示中の右クリックメニュー (読み取り専用なので開く操作だけ)。"""
+        pane = self.pane
+        index = self.indexAt(pos)
+        menu = QMenu(self)
+
+        def add(text, slot):
+            action = QAction(text, menu)
+            action.triggered.connect(lambda _checked=False: slot())
+            menu.addAction(action)
+
+        if index.isValid():
+            add("↗️開く / 実行 (Enter)", pane.open_selected_item)
+            menu.addSeparator()
+        add("🗜️ すべて展開 (ZIP のあるフォルダへ)", lambda: pane.extract_archive_to_parent(tab.archive_path))
+        add("📁 アーカイブを閉じる", pane.leave_archive)
+        menu.exec(self.viewport().mapToGlobal(pos))
+
     def show_context_menu(self, pos):
         pane = self.pane
+        tab = self._tab()
+        if tab is not None and tab.in_archive:
+            self._show_archive_context_menu(pos, tab)
+            return
         index = self.indexAt(pos)
         menu = QMenu(self)
 
@@ -419,6 +553,9 @@ class InteractiveTableView(QTableView):
 
             add("📋 パスをコピー", lambda: pane.copy_path_to_clipboard(path))
             add("ℹ️ プロパティ", lambda: pane.show_properties(path))
+            selected = pane.current_tab().selected_paths() if pane.current_tab() else []
+            if len(selected) == 1 and os.path.isfile(path):
+                add("🔑 ハッシュを計算", pane.open_hash_dialog)
             menu.addSeparator()
 
             add("🗜️ ZIPに圧縮", pane.compress_selected_to_zip)
@@ -455,6 +592,15 @@ class FileTab(QWidget):
 
         self.proxy = FileSortFilterProxyModel(self)
         self.proxy.setSourceModel(self.model)
+
+        # ZIP アーカイブ表示用 (通常表示とビューに差し込むモデルを切り替えて使う)
+        self._archive: "str | None" = None
+        self._inner = ""
+        self._archive_entries: dict = {}  # ZIP 内パス -> フォルダか (現在の階層分)
+        self.archive_model = QStandardItemModel(self)
+        self.archive_model.setHorizontalHeaderLabels(["名前", "サイズ", "種類", "更新日時"])
+        self.archive_proxy = ArchiveSortFilterProxyModel(self)
+        self.archive_proxy.setSourceModel(self.archive_model)
 
         self.view = InteractiveTableView(pane, self)
         self.view.setModel(self.proxy)
@@ -497,12 +643,113 @@ class FileTab(QWidget):
         self._history_index = len(self._history) - 1
 
     def _apply_path(self, path: str):
+        parsed = split_archive_path(path)
+        if parsed is not None:
+            archive, inner = parsed
+            self._apply_archive(archive, inner)
+            self._path = archive_virtual_path(archive, inner)
+            return
+        if self._archive is not None:
+            # アーカイブ表示から通常表示へ戻る
+            self._archive = None
+            self._inner = ""
+            self._archive_entries = {}
+            self._use_fs_view()
         self.model.setRootPath(path)
         if path:
             self.view.setRootIndex(self.proxy.mapFromSource(self.model.index(path)))
         else:
             self.view.setRootIndex(QModelIndex())
         self._path = path
+
+    # ---- アーカイブ表示 ------------------------------------------------
+    @property
+    def in_archive(self) -> bool:
+        return self._archive is not None
+
+    @property
+    def archive_path(self) -> "str | None":
+        return self._archive
+
+    @property
+    def archive_inner(self) -> str:
+        return self._inner
+
+    def archive_entry_is_dir(self, inner: str) -> bool:
+        """アーカイブ表示中、ZIP 内パス inner がフォルダなら True。"""
+        return bool(self._archive_entries.get(inner))
+
+    def _set_view_proxy(self, proxy):
+        if self.view.model() is proxy:
+            return
+        old_selection = self.view.selectionModel()
+        if old_selection is not None:
+            try:
+                old_selection.selectionChanged.disconnect(self._emit_selection_changed)
+            except (RuntimeError, TypeError):
+                pass  # 接続されていなければ何もしない
+        # 切替前の現在位置を消しておく (Qt が旧モデルのインデックスを変換しようとするため)
+        self.view.setCurrentIndex(QModelIndex())
+        self.view.setRootIndex(QModelIndex())
+        self.view.setModel(proxy)
+        self.view.selectionModel().selectionChanged.connect(self._emit_selection_changed)
+
+    def _use_archive_view(self):
+        self._set_view_proxy(self.archive_proxy)
+
+    def _use_fs_view(self):
+        self._set_view_proxy(self.proxy)
+
+    def _apply_archive(self, archive: str, inner: str):
+        self._archive = archive
+        self._inner = inner
+        self._use_archive_view()
+        self.view.setRootIndex(QModelIndex())
+        try:
+            entries = file_ops.list_zip_entries(archive, inner)
+        except Exception:  # noqa: BLE001 - 壊れた ZIP などは空表示にする (入る前に検証済み)
+            entries = []
+        self._fill_archive_model(entries)
+
+    def _fill_archive_model(self, entries):
+        self.archive_model.removeRows(0, self.archive_model.rowCount())
+        self._archive_entries = {}
+        for entry in entries:
+            self._archive_entries[entry.inner_path] = entry.is_dir
+            if entry.is_dir:
+                type_text = "フォルダ"
+            else:
+                ext = os.path.splitext(entry.name)[1].lstrip(".")
+                type_text = f"{ext.upper()} ファイル" if ext else "ファイル"
+
+            name_item = QStandardItem(entry.name)
+            name_item.setEditable(False)
+            name_item.setData(entry.is_dir, ROLE_IS_DIR)
+            name_item.setData(0 if entry.is_dir else entry.size, ROLE_SIZE)
+            name_item.setData(entry.inner_path, ROLE_INNER)
+            name_item.setData(type_text, ROLE_TYPE)
+            if entry.modified is not None:
+                name_item.setData(entry.modified.timestamp(), ROLE_MODIFIED)
+
+            size_item = QStandardItem("" if entry.is_dir else file_ops.format_size(entry.size))
+            size_item.setEditable(False)
+            type_item = QStandardItem(type_text)
+            type_item.setEditable(False)
+            date_item = QStandardItem(
+                entry.modified.strftime("%Y/%m/%d %H:%M") if entry.modified is not None else ""
+            )
+            date_item.setEditable(False)
+            self.archive_model.appendRow([name_item, size_item, type_item, date_item])
+        header = self.view.horizontalHeader()
+        self.archive_proxy.sort(header.sortIndicatorSection(), header.sortIndicatorOrder())
+
+    @staticmethod
+    def _is_valid_history_target(target: str) -> bool:
+        if not target:
+            return True
+        if split_archive_path(target) is not None:
+            return True
+        return os.path.isdir(target)
 
     @property
     def can_go_back(self) -> bool:
@@ -517,7 +764,7 @@ class FileTab(QWidget):
         while i > 0:
             i -= 1
             target = self._history[i]
-            if not target or os.path.isdir(target):
+            if self._is_valid_history_target(target):
                 self._history_index = i
                 self._apply_path(target)
                 return target
@@ -528,7 +775,7 @@ class FileTab(QWidget):
         while i < len(self._history) - 1:
             i += 1
             target = self._history[i]
-            if not target or os.path.isdir(target):
+            if self._is_valid_history_target(target):
                 self._history_index = i
                 self._apply_path(target)
                 return target
@@ -548,7 +795,10 @@ class FileTab(QWidget):
 
     def set_filter(self, text: str):
         self.filter_text = text
-        self.proxy.setFilterFixedString(text)
+        if self.in_archive:
+            self.archive_proxy.setFilterFixedString(text)
+        else:
+            self.proxy.setFilterFixedString(text)
 
     # ---- 表示設定 (隠しファイル・列幅・ソート) --------------------------
     def set_show_hidden(self, show: bool):
@@ -582,6 +832,12 @@ class FileTab(QWidget):
     def path_at(self, index: QModelIndex) -> str:
         if not index.isValid():
             return ""
+        if self.in_archive:
+            source = self.archive_proxy.mapToSource(index)
+            item = self.archive_model.item(source.row(), 0)
+            if item is None:
+                return ""
+            return archive_virtual_path(self._archive, item.data(ROLE_INNER) or "")
         return self.model.filePath(self.proxy.mapToSource(index))
 
     def current_item_path(self) -> str:
@@ -598,6 +854,18 @@ class FileTab(QWidget):
     def selection_summary(self) -> tuple:
         """(ファイル数, フォルダ数, ファイルの合計サイズ)。ディスクに触らずモデルの情報を使う。"""
         files = dirs = total = 0
+        if self.in_archive:
+            for index in self.view.selectionModel().selectedRows(0):
+                source = self.archive_proxy.mapToSource(index)
+                item = self.archive_model.item(source.row(), 0)
+                if item is None:
+                    continue
+                if item.data(ROLE_IS_DIR):
+                    dirs += 1
+                else:
+                    files += 1
+                    total += item.data(ROLE_SIZE) or 0
+            return files, dirs, total
         for index in self.view.selectionModel().selectedRows(0):
             source = self.proxy.mapToSource(index)
             if self.model.isDir(source):
@@ -996,13 +1264,35 @@ class PaneWidget(QWidget):
     def _warn(self, text: str):
         QMessageBox.warning(self, "警告", text)
 
+    def _in_archive_mode(self) -> bool:
+        tab = self.current_tab()
+        return bool(tab and tab.in_archive)
+
+    def _block_in_archive(self) -> bool:
+        """アーカイブ表示中はファイル操作を受け付けない (読み取り専用)。"""
+        if self._in_archive_mode():
+            self.set_status("アーカイブ内ではこの操作はできません（読み取り専用です）")
+            return True
+        return False
+
+    @staticmethod
+    def _archive_exit_path(archive: str) -> str:
+        """アーカイブを抜けたときの移動先 (ZIP のあるフォルダ。無ければ PC 一覧)。"""
+        parent = os.path.dirname(archive)
+        return parent if parent and parent != archive else ""
+
     def _set_search_text(self, text: str):
         self.search_input.blockSignals(True)  # 絞り込みを再実行させない
         self.search_input.setText(text)
         self.search_input.blockSignals(False)
 
     def update_path_bar(self, path: str):
-        self.path_input.setText(native(path) if path else PC_LABEL)
+        parsed = split_archive_path(path)
+        if parsed is not None:
+            archive, inner = parsed
+            self.path_input.setText(native(archive) + "!" + ("/" + inner if inner else ""))
+        else:
+            self.path_input.setText(native(path) if path else PC_LABEL)
 
     # ==================================================================
     # 設定の保存 / 復元 (QSettings)
@@ -1054,13 +1344,27 @@ class PaneWidget(QWidget):
                 widget.deleteLater()
         if paths:
             for saved in paths:
-                self.add_new_tab(saved if saved and os.path.isdir(saved) else "")
+                self.add_new_tab(self._restorable_path(saved))
             current = settings.value(f"{prefix}/current_tab", 0, type=int)
             if 0 <= current < self.tab_widget.count():
                 self.tab_widget.setCurrentIndex(current)
         else:
             self.add_new_tab("")
         self._on_tab_changed(self.tab_widget.currentIndex())
+
+    @staticmethod
+    def _restorable_path(saved) -> str:
+        """復元できるパスを返す。アーカイブの仮想パスは ZIP のあるフォルダに読み替える。"""
+        if not saved:
+            return ""
+        if os.path.isdir(saved):
+            return saved
+        parsed = split_archive_path(saved)
+        if parsed is not None:
+            parent = os.path.dirname(parsed[0])
+            if parent and os.path.isdir(parent):
+                return parent
+        return ""
 
     def _on_header_changed(self, *_args):
         """列幅やソートが変わったら、全タブに揃えて設定として保存する。"""
@@ -1111,7 +1415,7 @@ class PaneWidget(QWidget):
     # ==================================================================
     def add_new_tab(self, path: str = ""):
         path = normalize_path(path)
-        if path and not os.path.isdir(path):
+        if path and not os.path.isdir(path) and split_archive_path(path) is None:
             path = ""
 
         tab = FileTab(self, path, self.tab_widget)
@@ -1193,6 +1497,8 @@ class PaneWidget(QWidget):
         self.update_selection_stats()
         self._update_nav_buttons()
         self.path_changed.emit(path)
+        if tab.in_archive:
+            self.set_status(f"📦 アーカイブ内を表示しています（読み取り専用）: {os.path.basename(tab.archive_path)}")
 
     def go_back(self):
         tab = self.current_tab()
@@ -1214,6 +1520,8 @@ class PaneWidget(QWidget):
         self._create_new_item("text")
 
     def _create_new_item(self, kind: str):
+        if self._block_in_archive():
+            return
         tab = self.current_tab()
         dest_dir = self.get_current_path()
         if tab is None or not dest_dir or not os.path.isdir(dest_dir):
@@ -1231,9 +1539,25 @@ class PaneWidget(QWidget):
         tab.select_and_rename(path)
 
     def on_path_entered(self):
-        self.navigate_to_path(parse_user_path(self.path_input.text()))
+        path = parse_user_path(self.path_input.text())
+        if split_archive_path(path) is not None:
+            tab = self.current_tab()
+            if tab is not None:
+                tab.navigate(path)
+                self._sync_after_navigation(tab)
+            return
+        self.navigate_to_path(path)
 
     def go_parent_directory(self):
+        tab = self.current_tab()
+        if tab is not None and tab.in_archive:
+            if tab.archive_inner:
+                parent_inner = tab.archive_inner.rpartition("/")[0]
+                tab.navigate(archive_virtual_path(tab.archive_path, parent_inner))
+            else:
+                tab.navigate(self._archive_exit_path(tab.archive_path))
+            self._sync_after_navigation(tab)
+            return
         path = self.get_current_path()
         if not path:
             return
@@ -1271,10 +1595,54 @@ class PaneWidget(QWidget):
     def _open_path(self, path: str):
         if not path:
             return
+        tab = self.current_tab()
+        if tab is not None and tab.in_archive:
+            parsed = split_archive_path(path)
+            if parsed is not None:
+                archive, inner = parsed
+                if tab.archive_entry_is_dir(inner):
+                    tab.navigate(path)
+                    self._sync_after_navigation(tab)
+                elif inner:
+                    self._open_archive_entry(archive, inner)
+                return
         if os.path.isdir(path):
             self.navigate_to_path(path)
         elif os.path.isfile(path):
-            self._open_file(path)
+            if path.lower().endswith(".zip"):
+                self._open_archive(path)
+            else:
+                self._open_file(path)
+
+    def _open_archive(self, archive: str):
+        """ZIP を開き、同じタブをアーカイブ表示に切り替える。"""
+        tab = self.current_tab()
+        if tab is None:
+            return
+        try:
+            file_ops.list_zip_entries(archive, "")
+        except Exception as exc:  # noqa: BLE001
+            self._warn(f"ZIP を開けませんでした:\n{exc}")
+            return
+        tab.navigate(archive_virtual_path(archive))
+        self._sync_after_navigation(tab)
+
+    def _open_archive_entry(self, archive: str, inner: str):
+        """アーカイブ内のファイルを1つだけ展開して、関連付けられたアプリで開く。"""
+        try:
+            extracted = file_ops.extract_zip_entry(archive, inner)
+        except Exception as exc:  # noqa: BLE001
+            self._warn(f"ファイルを開けませんでした:\n{exc}")
+            return
+        self._open_file(extracted)
+
+    def leave_archive(self):
+        """アーカイブ表示を終了し、ZIP のあるフォルダへ戻る。"""
+        tab = self.current_tab()
+        if tab is None or not tab.in_archive:
+            return
+        tab.navigate(self._archive_exit_path(tab.archive_path))
+        self._sync_after_navigation(tab)
 
     def _open_file(self, path: str):
         try:
@@ -1308,6 +1676,8 @@ class PaneWidget(QWidget):
             QuickLookDialog(path, self).exec()
 
     def open_batch_rename(self):
+        if self._block_in_archive():
+            return
         tab = self.current_tab()
         selected = tab.selected_paths() if tab else []
         if not selected:
@@ -1320,6 +1690,17 @@ class PaneWidget(QWidget):
             return
 
         BatchRenameDialog(file_paths, self).exec()
+
+    def open_hash_dialog(self):
+        """選択中のファイル1つのハッシュ計算ダイアログを開く。"""
+        if self._block_in_archive():
+            return
+        tab = self.current_tab()
+        selected = tab.selected_paths() if tab else []
+        if len(selected) != 1 or not os.path.isfile(selected[0]):
+            self._warn("ハッシュを計算するファイルを1つ選択してください。")
+            return
+        HashDialog(selected[0], self).exec()
 
     # ==================================================================
     # 選択の統計
@@ -1343,7 +1724,7 @@ class PaneWidget(QWidget):
 
         # フォルダが1つだけ選ばれているときは、中身の合計サイズも数えて表示する
         selected = tab.selected_paths()
-        if dirs == 1 and files == 0 and len(selected) == 1:
+        if dirs == 1 and files == 0 and len(selected) == 1 and not tab.in_archive:
             self.set_status("選択中: フォルダ 1個  |  合計サイズ: 計算中...")
             start_folder_size_worker(selected[0], self._on_folder_size_ready)
 
@@ -1363,6 +1744,8 @@ class PaneWidget(QWidget):
         self._set_clipboard(cut=True)
 
     def _set_clipboard(self, cut: bool):
+        if self._block_in_archive():
+            return
         tab = self.current_tab()
         paths = tab.selected_paths() if tab else []
         verb = "切り取る" if cut else "コピーする"
@@ -1397,6 +1780,8 @@ class PaneWidget(QWidget):
         return paths, is_cut
 
     def paste_items(self):
+        if self._block_in_archive():
+            return
         dest_dir = self.get_current_path()
         if not dest_dir or not os.path.isdir(dest_dir):
             self._warn("貼り付け先のディレクトリが有効ではありません。（PCドライブ一覧では貼り付けできません）")
@@ -1414,6 +1799,9 @@ class PaneWidget(QWidget):
     # ==================================================================
     def accept_drop(self, paths: list, dest_dir: str, move: bool):
         """ドロップされた項目を dest_dir へコピー / 移動する (ペイン間・エクスプローラー間共通)。"""
+        if self._in_archive_mode():
+            self.set_status("アーカイブ内へはドロップできません")
+            return
         if not dest_dir or not os.path.isdir(dest_dir):
             return
         dest_abs = os.path.normcase(os.path.abspath(dest_dir))
@@ -1439,11 +1827,16 @@ class PaneWidget(QWidget):
         self.set_status(f"パスをコピーしました: {native(path)}")
 
     def show_properties(self, path: str):
+        if split_archive_path(path) is not None:
+            self.set_status("アーカイブ内の項目のプロパティは表示できません")
+            return
         if path:
             PropertiesDialog(path, self).exec()
 
     def compress_selected_to_zip(self):
         """選択中の項目を、表示中のフォルダ内に ZIP 圧縮する。"""
+        if self._block_in_archive():
+            return
         tab = self.current_tab()
         paths = tab.selected_paths() if tab else []
         if not paths:
@@ -1454,6 +1847,14 @@ class PaneWidget(QWidget):
             self._warn("圧縮先のフォルダが有効ではありません。（PCドライブ一覧では圧縮できません）")
             return
         self._run_archive("compress", paths, dest_dir)
+
+    def extract_archive_to_parent(self, archive: str):
+        """アーカイブ表示中の ZIP を、ZIP のあるフォルダへすべて展開する。"""
+        dest_dir = os.path.dirname(archive)
+        if not dest_dir or not os.path.isdir(dest_dir):
+            self._warn("展開先のフォルダが有効ではありません。")
+            return
+        self._run_archive("extract", [], dest_dir, archive=archive)
 
     def extract_zip_archive(self, archive: str):
         """ZIP を表示中のフォルダへ展開する。"""
@@ -1523,6 +1924,8 @@ class PaneWidget(QWidget):
         self._transfer_to_opposite("move")
 
     def _transfer_to_opposite(self, kind: str):
+        if self._block_in_archive():
+            return
         tab = self.current_tab()
         paths = tab.selected_paths() if tab else []
         verb = OPERATION_LABELS[kind]
@@ -1546,6 +1949,8 @@ class PaneWidget(QWidget):
         self._delete(permanent=True)
 
     def _delete(self, permanent: bool):
+        if self._block_in_archive():
+            return
         tab = self.current_tab()
         paths = tab.selected_paths() if tab else []
         if not paths:

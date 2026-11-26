@@ -97,6 +97,32 @@ class QuickLookDialog(QDialog):
         except ImportError:
             return False
         view = QWebEngineView(self)
+        # リンクのクリックなどで外部サイトへ遷移しないよう、最初に読み込む
+        # ローカルファイル以外へのナビゲーションを拒否するページを使う。
+        # これはセキュリティ機能のため、ページや設定の適用に失敗した場合は
+        # プレビュー自体を中止し、呼び出し側のソース表示に委ねる (fail-closed)。
+        try:
+            from PySide6.QtWebEngineCore import QWebEnginePage
+
+            class _LocalOnlyPage(QWebEnginePage):
+                """初期表示のローカルファイル以外への遷移を拒否する。"""
+
+                def __init__(self, parent=None):
+                    super().__init__(parent)
+                    self._initial_pending = True
+
+                def acceptNavigationRequest(self, url, nav_type, is_main_frame):
+                    if is_main_frame:
+                        if self._initial_pending:
+                            self._initial_pending = False
+                            return True
+                        return False
+                    return url.scheme() in ("file", "about", "data", "qrc")
+
+            view.setPage(_LocalOnlyPage(view))
+        except Exception:
+            view.deleteLater()
+            return False
         # ローカルHTMLのプレビュー専用: スクリプトと外部通信は無効化する
         try:
             from PySide6.QtWebEngineCore import QWebEngineSettings
@@ -106,7 +132,8 @@ class QuickLookDialog(QDialog):
             settings.setAttribute(WA.LocalContentCanAccessRemoteUrls, False)
             settings.setAttribute(WA.PluginsEnabled, False)
         except Exception:
-            pass
+            view.deleteLater()
+            return False
         view.setUrl(QUrl.fromLocalFile(os.path.abspath(self.file_path)))
         self._layout.addWidget(view)
         return True

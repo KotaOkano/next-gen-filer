@@ -181,7 +181,8 @@ class FileToolsDialog(QDialog):
         warning = QLabel(
             "⚠️ 【警告】シュレッダーを実行すると、ファイルの内容がランダムなデータで上書きされた上で"
             "削除され、元に戻せません。通常のデータ復元ソフトでの復元は非常に困難になります。\n\n"
-            "ただし、SSD・クラウド同期（OneDrive など）・シャドウコピーでは、古いデータが別の場所に"
+            "ただし、SSD ではウェアレベリングのため、上書きしたはずの領域に古いデータが残ることが"
+            "あります。また、クラウド同期（OneDrive など）・シャドウコピーでは、古いデータが別の場所に"
             "残ることがあり、完全な消去は保証できません。特に重要なデータは、ドライブ全体の暗号化"
             "（BitLocker など）と併用してください。"
         )
@@ -301,12 +302,12 @@ class FileToolsDialog(QDialog):
         output = os.path.normpath(result["output"])
         if result["deleted"]:
             QMessageBox.information(
-                self, "暗号化成功", f"ファイルを暗号化しました:\n{output}\n\n元のファイルは完全削除しました。"
+                self, "暗号化成功", f"ファイルを暗号化しました:\n{output}\n\n元のファイルを上書き消去しました。"
             )
         elif result["delete_error"]:
             text = (
                 f"ファイルを暗号化しました:\n{output}\n\n"
-                f"ただし、元のファイルの完全削除は完了しませんでした:\n{result['delete_error']}"
+                f"ただし、元のファイルの上書き消去は完了しませんでした:\n{result['delete_error']}"
             )
             if result["original_damaged"]:
                 text += "\n\n元のファイルは一部が上書きされている可能性があります。暗号化ファイルから復号して確認してください。"
@@ -383,7 +384,7 @@ class FileToolsDialog(QDialog):
         QMessageBox.information(
             self,
             "完了",
-            "ファイルをランダムデータで上書きし、削除しました。\n\n"
+            "ファイルをランダムデータで上書き消去しました。\n\n"
             "※ SSD やクラウド同期のフォルダでは、古いデータが別の場所に残る可能性があります。",
         )
         self.shred_path_input.clear()

@@ -192,8 +192,8 @@ def encrypt_file(
     元のファイルには触れない。同名の出力があれば別名にする（output_path を明示した場合はエラー）。
     """
     _require_file(file_path)
-    if iterations < MIN_ITERATIONS:
-        raise ValueError("反復回数が小さすぎます")
+    if not MIN_ITERATIONS <= iterations <= MAX_ITERATIONS:
+        raise ValueError("反復回数が範囲外です")
     pwd = _password_bytes(password)
     desired, explicit = _resolve_output(file_path + ENC_EXT, output_path)
 

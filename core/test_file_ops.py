@@ -594,5 +594,275 @@ class ZipTests(FileOpsTestCase):
 
 
 
+class ArchiveBrowseTests(FileOpsTestCase):
+    """v1.3.0: ZIP の中身の参照 (アーカイブ表示用)。"""
+
+    def _make_archive(self):
+        import zipfile
+
+        archive = os.path.join(self.root, "sample.zip")
+        with zipfile.ZipFile(archive, "w") as zf:
+            zf.writestr("root.txt", "root-content")
+            zf.writestr("sub/inner.txt", "inner-content")
+            zf.writestr("sub/deep/deeper.txt", "deep-content")
+            zf.writestr("sub2/other.txt", "other")
+            zf.writestr("emptydir/", "")
+        return archive
+
+    def test_list_root_level(self):
+        entries = file_ops.list_zip_entries(self._make_archive())
+        by_name = {e.name: e for e in entries}
+        self.assertEqual(set(by_name), {"root.txt", "sub", "sub2", "emptydir"})
+        self.assertFalse(by_name["root.txt"].is_dir)
+        self.assertEqual(by_name["root.txt"].size, len("root-content"))
+        self.assertEqual(by_name["root.txt"].inner_path, "root.txt")
+        self.assertIsNotNone(by_name["root.txt"].modified)
+        for folder in ("sub", "sub2", "emptydir"):
+            self.assertTrue(by_name[folder].is_dir)
+            self.assertEqual(by_name[folder].size, 0)
+        # フォルダが先頭に来る
+        self.assertTrue(entries[0].is_dir)
+
+    def test_list_implicit_folders(self):
+        import zipfile
+
+        archive = os.path.join(self.root, "implicit.zip")
+        with zipfile.ZipFile(archive, "w") as zf:
+            zf.writestr("a/b/c.txt", "c")  # フォルダ項目なしで深いパスだけ入れる
+        entries = file_ops.list_zip_entries(archive)
+        self.assertEqual([(e.name, e.is_dir) for e in entries], [("a", True)])
+        entries = file_ops.list_zip_entries(archive, "a")
+        self.assertEqual([(e.name, e.is_dir) for e in entries], [("b", True)])
+        entries = file_ops.list_zip_entries(archive, "a/b")
+        self.assertEqual([(e.name, e.is_dir, e.inner_path) for e in entries], [("c.txt", False, "a/b/c.txt")])
+
+    def test_list_subfolder(self):
+        entries = file_ops.list_zip_entries(self._make_archive(), "sub")
+        by_name = {e.name: e for e in entries}
+        self.assertEqual(set(by_name), {"inner.txt", "deep"})
+        self.assertEqual(by_name["inner.txt"].inner_path, "sub/inner.txt")
+        self.assertTrue(by_name["deep"].is_dir)
+        entries = file_ops.list_zip_entries(self._make_archive(), "sub/deep")
+        self.assertEqual([e.name for e in entries], ["deeper.txt"])
+
+    def test_list_missing_dir_returns_empty(self):
+        self.assertEqual(file_ops.list_zip_entries(self._make_archive(), "nope"), [])
+
+    def test_list_rejects_traversal(self):
+        with self.assertRaises(ValueError):
+            file_ops.list_zip_entries(self._make_archive(), "../outside")
+
+    def test_extract_single_entry(self):
+        archive = self._make_archive()
+        out = os.path.join(self.root, "one")
+        os.makedirs(out)
+        path = file_ops.extract_zip_entry(archive, "sub/inner.txt", out)
+        self.assertEqual(path, os.path.join(out, "sub", "inner.txt"))
+        self.assertEqual(read(path), "inner-content")
+
+    def test_extract_single_entry_default_temp(self):
+        path = file_ops.extract_zip_entry(self._make_archive(), "root.txt")
+        self.assertTrue(os.path.isfile(path))
+        self.assertEqual(read(path), "root-content")
+
+    def test_extract_missing_entry(self):
+        with self.assertRaises(FileNotFoundError):
+            file_ops.extract_zip_entry(self._make_archive(), "sub/nope.txt", self.dst)
+
+    def test_extract_rejects_traversal(self):
+        archive = self._make_archive()
+        with self.assertRaises(ValueError):
+            file_ops.extract_zip_entry(archive, "../escape.txt", self.dst)
+        self.assertFalse(os.path.exists(os.path.join(self.root, "escape.txt")))
+
+
+class HashTests(FileOpsTestCase):
+    """v1.3.0: ハッシュ計算と照合。"""
+
+    def _write_bytes(self, name, data: bytes):
+        path = os.path.join(self.src, name)
+        with open(path, "wb") as f:
+            f.write(data)
+        return path
+
+    def test_known_vectors_abc(self):
+        path = self._write_bytes("abc.bin", b"abc")
+        self.assertEqual(file_ops.compute_file_hash(path, "md5"), "900150983cd24fb0d6963f7d28e17f72")
+        self.assertEqual(file_ops.compute_file_hash(path, "sha1"), "a9993e364706816aba3e25717850c26c9cd0d89d")
+        self.assertEqual(
+            file_ops.compute_file_hash(path, "sha256"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+        )
+        self.assertEqual(
+            file_ops.compute_file_hash(path, "sha512"),
+            "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a"
+            "2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f",
+        )
+
+    def test_known_vectors_empty(self):
+        path = self._write_bytes("empty.bin", b"")
+        self.assertEqual(file_ops.compute_file_hash(path, "md5"), "d41d8cd98f00b204e9800998ecf8427e")
+        self.assertEqual(
+            file_ops.compute_file_hash(path, "sha256"),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        )
+
+    def test_default_algorithm_is_sha256(self):
+        path = self._write_bytes("abc.bin", b"abc")
+        self.assertEqual(file_ops.compute_file_hash(path), file_ops.compute_file_hash(path, "sha256"))
+
+    def test_progress_reaches_total(self):
+        path = self._write_bytes("data.bin", b"12345")
+        seen = []
+        file_ops.compute_file_hash(path, progress=lambda d, t: seen.append((d, t)))
+        self.assertEqual(seen[-1], (5, 5))
+
+    def test_progress_for_empty_file(self):
+        path = self._write_bytes("empty.bin", b"")
+        seen = []
+        file_ops.compute_file_hash(path, progress=lambda d, t: seen.append((d, t)))
+        self.assertEqual(seen, [(0, 0)])
+
+    def test_cancel_raises(self):
+        path = self._write_bytes("data.bin", b"12345")
+        with self.assertRaises(file_ops.OperationCancelled):
+            file_ops.compute_file_hash(path, is_cancelled=lambda: True)
+
+    def test_unknown_algorithm(self):
+        path = self._write_bytes("data.bin", b"x")
+        with self.assertRaises(ValueError):
+            file_ops.compute_file_hash(path, "no-such-algorithm")
+
+    def test_hash_matches_ignores_case_and_whitespace(self):
+        digest = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        self.assertTrue(file_ops.hash_matches(digest, digest.upper()))
+        self.assertTrue(file_ops.hash_matches(digest, "  " + digest + "\n"))
+        self.assertTrue(file_ops.hash_matches(digest, digest[:32] + " " + digest[32:]))
+
+    def test_hash_matches_rejects_wrong_and_empty(self):
+        digest = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        self.assertFalse(file_ops.hash_matches(digest, "0" * 64))
+        self.assertFalse(file_ops.hash_matches(digest, ""))
+        self.assertFalse(file_ops.hash_matches(digest, "   \n"))
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
+class ZipSecurityTests(FileOpsTestCase):
+    """v1.3.0 セキュリティ修正: ZIP 展開のリンク経由脱出と ZIP 爆弾対策。"""
+
+    def _make_zip(self, name, entries):
+        import zipfile
+
+        archive = os.path.join(self.root, name)
+        with zipfile.ZipFile(archive, "w") as zf:
+            for arcname, data in entries:
+                zf.writestr(arcname, data)
+        return archive
+
+    def test_extract_does_not_follow_symlink_to_outside(self):
+        outside = os.path.join(self.root, "outside")
+        os.makedirs(outside)
+        out = os.path.join(self.root, "out")
+        os.makedirs(out)
+        os.symlink(outside, os.path.join(out, "link"))
+        archive = self._make_zip("link.zip", [("link/evil.txt", "bad"), ("ok.txt", "good")])
+        created = file_ops.extract_zip(archive, out)
+        self.assertFalse(os.path.exists(os.path.join(outside, "evil.txt")))
+        self.assertEqual(created, [os.path.join(out, "ok.txt")])
+        self.assertEqual(read(os.path.join(out, "ok.txt")), "good")
+
+    def test_extract_into_destination_reached_via_symlink(self):
+        real_dest = os.path.join(self.root, "real_out")
+        os.makedirs(real_dest)
+        link_dest = os.path.join(self.root, "link_out")
+        os.symlink(real_dest, link_dest)
+        write(os.path.join(self.src, "a.txt"), "hello")
+        archive = file_ops.create_zip([os.path.join(self.src, "a.txt")], self.dst)
+        file_ops.extract_zip(archive, link_dest)
+        self.assertEqual(read(os.path.join(real_dest, "a.txt")), "hello")
+
+    def test_extract_entry_does_not_follow_symlink_to_outside(self):
+        outside = os.path.join(self.root, "outside")
+        os.makedirs(outside)
+        dest = os.path.join(self.root, "dest")
+        os.makedirs(dest)
+        os.symlink(outside, os.path.join(dest, "link"))
+        archive = self._make_zip("link.zip", [("link/evil.txt", "bad")])
+        with self.assertRaises(ValueError):
+            file_ops.extract_zip_entry(archive, "link/evil.txt", dest)
+        self.assertFalse(os.path.exists(os.path.join(outside, "evil.txt")))
+
+    def test_extract_rejects_too_many_entries(self):
+        archive = self._make_zip("many.zip", [("a.txt", "a"), ("b.txt", "b")])
+        out = os.path.join(self.root, "out")
+        os.makedirs(out)
+        with mock.patch.object(file_ops, "MAX_ZIP_ENTRIES", 1):
+            with self.assertRaises(ValueError):
+                file_ops.extract_zip(archive, out)
+        self.assertEqual(os.listdir(out), [])
+
+    def test_extract_rejects_when_declared_total_exceeds_free_space(self):
+        archive = self._make_zip("big.zip", [("a.txt", "x" * 100)])
+        out = os.path.join(self.root, "out")
+        os.makedirs(out)
+        with mock.patch.object(file_ops.shutil, "disk_usage", return_value=mock.Mock(free=10)):
+            with self.assertRaises(ValueError):
+                file_ops.extract_zip(archive, out)
+        self.assertEqual(os.listdir(out), [])
+
+    def test_extract_rejects_entry_over_file_size_cap(self):
+        archive = self._make_zip("cap.zip", [("a.txt", "x" * 100)])
+        out = os.path.join(self.root, "out")
+        os.makedirs(out)
+        with mock.patch.object(file_ops, "MAX_ZIP_FILE_SIZE", 10):
+            with self.assertRaises(ValueError) as ctx:
+                file_ops.extract_zip(archive, out)
+        self.assertIn("100 bytes > 上限 10 bytes", str(ctx.exception))
+        self.assertEqual(os.listdir(out), [])
+
+    def test_extract_rejects_total_over_total_size_cap(self):
+        archive = self._make_zip(
+            "totalcap.zip", [("a.txt", "x" * 60), ("b.txt", "y" * 60)]
+        )
+        out = os.path.join(self.root, "out")
+        os.makedirs(out)
+        with mock.patch.object(file_ops, "MAX_ZIP_TOTAL_SIZE", 100):
+            with self.assertRaises(ValueError):
+                file_ops.extract_zip(archive, out)
+        self.assertEqual(os.listdir(out), [])
+
+    def test_extract_entry_rejects_over_file_size_cap(self):
+        archive = self._make_zip("entrycap.zip", [("a.txt", "x" * 100)])
+        out = os.path.join(self.root, "out")
+        os.makedirs(out)
+        with mock.patch.object(file_ops, "MAX_ZIP_FILE_SIZE", 10):
+            with self.assertRaises(ValueError):
+                file_ops.extract_zip_entry(archive, "a.txt", out)
+        self.assertEqual(os.listdir(out), [])
+
+    def test_extract_within_size_caps_still_works(self):
+        archive = self._make_zip("small.zip", [("a.txt", "hello")])
+        out = os.path.join(self.root, "out")
+        os.makedirs(out)
+        with mock.patch.object(file_ops, "MAX_ZIP_FILE_SIZE", 100), \
+                mock.patch.object(file_ops, "MAX_ZIP_TOTAL_SIZE", 100):
+            created = file_ops.extract_zip(archive, out)
+            self.assertEqual(created, [os.path.join(out, "a.txt")])
+            self.assertEqual(read(os.path.join(out, "a.txt")), "hello")
+            single = os.path.join(self.root, "single")
+            os.makedirs(single)
+            result = file_ops.extract_zip_entry(archive, "a.txt", single)
+            self.assertEqual(read(result), "hello")
+
+    def test_copy_zip_entry_guard_rejects_oversized_stream(self):
+        import io
+
+        with self.assertRaises(ValueError):
+            file_ops._copy_zip_entry(io.BytesIO(b"x" * 10), io.BytesIO(), 5, None)
+        out = io.BytesIO()
+        written = file_ops._copy_zip_entry(io.BytesIO(b"12345"), out, 5, None)
+        self.assertEqual(written, 5)
+        self.assertEqual(out.getvalue(), b"12345")
